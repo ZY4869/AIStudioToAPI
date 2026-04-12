@@ -89,6 +89,64 @@ class RequestHandler {
         return fallback;
     }
 
+    _isGeminiGenerativeRequest(req) {
+        return (
+            req.method === "POST" &&
+            (req.path.includes("generateContent") || req.path.includes("streamGenerateContent"))
+        );
+    }
+
+    _validateGeminiNativeRequest(req) {
+        if (!this._isGeminiGenerativeRequest(req)) {
+            return null;
+        }
+
+        const contents = req.body?.contents;
+        if (!Array.isArray(contents) || contents.length === 0) {
+            return {
+                message: "Invalid Gemini request format: contents must be a non-empty array.",
+                status: 400,
+            };
+        }
+
+        const hasAtLeastOnePart = contents.some(content => Array.isArray(content?.parts) && content.parts.length > 0);
+        if (!hasAtLeastOnePart) {
+            return {
+                message: "Invalid Gemini request format: contents must contain at least one part.",
+                status: 400,
+            };
+        }
+
+        return null;
+    }
+
+    _recordGenerativeUsage(logLabel = "Generation request") {
+        const usageCount = this.authSwitcher.incrementUsageCount();
+        if (usageCount <= 0) {
+            return;
+        }
+
+        const rotationCountText =
+            this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
+        this.logger.info(
+            `[Request] ${logLabel} - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex})`
+        );
+
+        if (this.authSwitcher.shouldSwitchByUsage()) {
+            this.needsSwitchingAfterRequest = true;
+        }
+    }
+
+    _isNonRetryableClientError(errorPayload) {
+        const status = Number(errorPayload?.status);
+        if (!Number.isFinite(status) || status < 400 || status >= 500) {
+            return false;
+        }
+
+        // 401/403 often indicate account-level auth/capability issues, and 429 is handled separately.
+        return ![401, 403, 408, 409, 425, 429].includes(status);
+    }
+
     _startTrackedRequest(requestId, req, meta = {}) {
         const usageStatsService = this._getUsageStatsService();
         if (!usageStatsService) return;
@@ -751,6 +809,15 @@ class RequestHandler {
         res.__proxyResponseStreamMode = null;
 
         try {
+            const isGenerativeRequest = this._isGeminiGenerativeRequest(req);
+            const wantsStream = req.path.includes(":streamGenerateContent");
+            const validationError = this._validateGeminiNativeRequest(req);
+            if (validationError) {
+                this.logger.warn(`[Request] Rejecting invalid Gemini request: ${validationError.message}`);
+                this._sendErrorResponse(res, validationError.status, validationError.message);
+                return;
+            }
+
             // Check current account's browser connection
             if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
                 this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
@@ -775,30 +842,15 @@ class RequestHandler {
             if (this.browserManager) {
                 this.browserManager.notifyUserActivity();
             }
-            // Handle usage-based account switching
-            const isGenerativeRequest =
-                req.method === "POST" &&
-                (req.path.includes("generateContent") || req.path.includes("streamGenerateContent"));
-
-            if (isGenerativeRequest) {
-                const usageCount = this.authSwitcher.incrementUsageCount();
-                if (usageCount > 0) {
-                    const rotationCountText =
-                        this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
-                    this.logger.info(
-                        `[Request] Generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex})`
-                    );
-                    if (this.authSwitcher.shouldSwitchByUsage()) {
-                        this.needsSwitchingAfterRequest = true;
-                    }
-                }
-            }
 
             const proxyRequest = this._buildProxyRequest(req, requestId);
             proxyRequest.is_generative = isGenerativeRequest;
             this._initializeProxyRequestAttempt(proxyRequest);
 
-            const wantsStream = req.path.includes(":streamGenerateContent");
+            if (isGenerativeRequest) {
+                this._recordGenerativeUsage("Generation request");
+            }
+
             res.__proxyResponseStreamMode = wantsStream ? proxyRequest.streaming_mode : null;
 
             this._updateTrackedRequest(requestId, {
@@ -971,19 +1023,6 @@ class RequestHandler {
             const isOpenAIStream = req.body.stream === true;
             const systemStreamMode = this.serverSystem.streamingMode;
 
-            // Handle usage counting
-            const usageCount = this.authSwitcher.incrementUsageCount();
-            if (usageCount > 0) {
-                const rotationCountText =
-                    this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
-                this.logger.info(
-                    `[Request] OpenAI generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex})`
-                );
-                if (this.authSwitcher.shouldSwitchByUsage()) {
-                    this.needsSwitchingAfterRequest = true;
-                }
-            }
-
             // Translate OpenAI format to Google format (also handles model name suffix parsing)
             let googleBody, model, modelStreamingMode;
             try {
@@ -995,6 +1034,8 @@ class RequestHandler {
                 this.logger.error(`[Adapter] OpenAI request translation failed: ${error.message}`);
                 return this._sendErrorResponse(res, 400, "Invalid OpenAI request format.");
             }
+
+            this._recordGenerativeUsage("OpenAI generation request");
 
             const effectiveStreamMode = modelStreamingMode || systemStreamMode;
             const useRealStream = isOpenAIStream && effectiveStreamMode === "real";
@@ -1376,19 +1417,6 @@ class RequestHandler {
             );
             const systemStreamMode = this.serverSystem.streamingMode;
 
-            // Handle usage counting
-            const usageCount = this.authSwitcher.incrementUsageCount();
-            if (usageCount > 0) {
-                const rotationCountText =
-                    this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
-                this.logger.info(
-                    `[Request] OpenAI Response generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex})`
-                );
-                if (this.authSwitcher.shouldSwitchByUsage()) {
-                    this.needsSwitchingAfterRequest = true;
-                }
-            }
-
             // Translate OpenAI Response format to Google format
             let googleBody, model, modelStreamingMode;
             try {
@@ -1400,6 +1428,8 @@ class RequestHandler {
                 this.logger.error(`[Adapter] OpenAI Response request translation failed: ${error.message}`);
                 return this._sendErrorResponse(res, 400, "Invalid OpenAI Response request format.");
             }
+
+            this._recordGenerativeUsage("OpenAI Response generation request");
 
             const effectiveStreamMode = modelStreamingMode || systemStreamMode;
             const useRealStream = isOpenAIStream && effectiveStreamMode === "real";
@@ -1754,19 +1784,6 @@ class RequestHandler {
             const isClaudeStream = req.body.stream === true;
             const systemStreamMode = this.serverSystem.streamingMode;
 
-            // Handle usage counting
-            const usageCount = this.authSwitcher.incrementUsageCount();
-            if (usageCount > 0) {
-                const rotationCountText =
-                    this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
-                this.logger.info(
-                    `[Request] Claude generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex})`
-                );
-                if (this.authSwitcher.shouldSwitchByUsage()) {
-                    this.needsSwitchingAfterRequest = true;
-                }
-            }
-
             // Translate Claude format to Google format
             let googleBody, model, modelStreamingMode;
             try {
@@ -1783,6 +1800,8 @@ class RequestHandler {
                     "Invalid Claude request format."
                 );
             }
+
+            this._recordGenerativeUsage("Claude generation request");
 
             const effectiveStreamMode = modelStreamingMode || systemStreamMode;
             const useRealStream = isClaudeStream && effectiveStreamMode === "real";
@@ -3264,9 +3283,17 @@ class RequestHandler {
                 }
 
                 lastError = errorPayload;
+                const errorStatus = Number(errorPayload?.status);
+
+                if (this._isNonRetryableClientError(errorPayload)) {
+                    lastError = { ...errorPayload, skipAccountSwitch: true };
+                    this.logger.warn(
+                        `[Request] Non-retryable client error for request #${proxyRequest.request_id} (status ${errorStatus}), aborting retries.`
+                    );
+                    break;
+                }
 
                 // Check if we should stop retrying immediately based on status code
-                const errorStatus = Number(errorPayload?.status);
                 if (
                     Number.isFinite(errorStatus) &&
                     this.config?.immediateSwitchStatusCodes?.includes(errorStatus) &&
