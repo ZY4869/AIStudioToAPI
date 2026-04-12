@@ -2268,16 +2268,8 @@
                                             <span
                                                 class="outcome-badge"
                                                 :class="`is-${record.outcome}`"
-                                                :style="
-                                                    record.outcome === 'error' && record.errorMessage
-                                                        ? 'cursor: pointer'
-                                                        : ''
-                                                "
-                                                :title="
-                                                    record.outcome === 'error' && record.errorMessage
-                                                        ? t('clickToViewError')
-                                                        : ''
-                                                "
+                                                :style="canShowErrorDetail(record) ? 'cursor: pointer' : ''"
+                                                :title="canShowErrorDetail(record) ? t('clickToViewError') : ''"
                                                 @click="showErrorDetail(record)"
                                             >
                                                 {{ translateLabel(record.outcome) }}
@@ -3136,7 +3128,7 @@ const fetchUsageStats = async () => {
 };
 
 const showErrorDetail = record => {
-    if (!record || record.outcome !== "error") return;
+    if (!canShowErrorDetail(record)) return;
     ElMessageBox.alert(record.errorMessage || t("errorUnknown"), t("errorDetailTitle"), {
         closeOnClickModal: true,
         confirmButtonText: t("ok"),
@@ -3144,6 +3136,9 @@ const showErrorDetail = record => {
         type: "error",
     });
 };
+
+const canShowErrorDetail = record =>
+    !!record && (record.outcome === "error" || record.outcome === "aborted") && !!record.errorMessage;
 
 const showAttemptsDetail = record => {
     if (!record || !record.attempts || record.attempts.length === 0) return;
