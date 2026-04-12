@@ -6118,6 +6118,10 @@ watchEffect(() => {
         white-space: nowrap;
     }
 
+    tbody td {
+        vertical-align: middle;
+    }
+
     /* Solid background for generic th to prevent scroll-under contents from showing through */
     th {
         position: sticky;
