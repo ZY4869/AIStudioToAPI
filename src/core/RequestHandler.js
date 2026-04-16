@@ -62,6 +62,10 @@ class RequestHandler {
         return this.serverSystem.usageStatsService || null;
     }
 
+    _getSleepManager() {
+        return this.serverSystem.sleepManager || null;
+    }
+
     _getAccountNameForIndex(authIndex) {
         if (!Number.isInteger(authIndex) || authIndex < 0) {
             return null;
@@ -72,6 +76,145 @@ class RequestHandler {
 
     _getClientIp(req) {
         return this.serverSystem.webRoutes.authRoutes.getClientIP(req);
+    }
+
+    async _beginBrowserBoundRequest(res, format = "generic") {
+        const sleepManager = this._getSleepManager();
+        if (sleepManager) {
+            const decision = await sleepManager.prepareForRequest();
+            if (!decision.allowed) {
+                this._sendPreflightBlockedResponse(res, format, decision);
+                return false;
+            }
+
+            sleepManager.recordActivity();
+            sleepManager.onRequestStart();
+        }
+
+        if (this.browserManager) {
+            this.browserManager.notifyUserActivity();
+        }
+
+        return true;
+    }
+
+    async _endBrowserBoundRequest(started) {
+        if (!started) return;
+        const sleepManager = this._getSleepManager();
+        if (sleepManager) {
+            await sleepManager.onRequestEnd();
+        }
+    }
+
+    _sendApiFormattedErrorResponse(res, format, status, message, details = {}) {
+        const normalizedStatus = status || 500;
+        const errorType =
+            details.errorType ||
+            (normalizedStatus === 429
+                ? "rate_limit_exceeded"
+                : normalizedStatus === 503
+                  ? "service_unavailable"
+                  : "api_error");
+        const claudeErrorType = normalizedStatus === 429 || normalizedStatus === 503 ? "overloaded_error" : "api_error";
+        const { errorType: ignoredErrorType, statusText, ...extraFields } = details;
+        void ignoredErrorType;
+
+        if (format === "claude") {
+            this._sendClaudeErrorResponse(res, normalizedStatus, claudeErrorType, message, extraFields);
+            return;
+        }
+
+        if (!res.headersSent && (format === "openai" || format === "response_api")) {
+            this._markTrackedResponseError(res, message, normalizedStatus);
+
+            if (format === "response_api") {
+                res.status(normalizedStatus)
+                    .type("application/json")
+                    .send(
+                        JSON.stringify({
+                            code: errorType,
+                            message,
+                            param: null,
+                            type: "error",
+                            ...extraFields,
+                        })
+                    );
+                return;
+            }
+
+            res.status(normalizedStatus)
+                .type("application/json")
+                .send(
+                    JSON.stringify({
+                        error: {
+                            code: normalizedStatus,
+                            message,
+                            type: errorType,
+                            ...extraFields,
+                        },
+                    })
+                );
+            return;
+        }
+
+        this._sendErrorResponse(res, normalizedStatus, message, {
+            ...extraFields,
+            statusText,
+        });
+    }
+
+    _sendPreflightBlockedResponse(res, format, decision = {}) {
+        const status = Number(decision.status) || 503;
+        const message =
+            decision.message ||
+            (decision.reason === "all_accounts_cooling_down"
+                ? "All available accounts are cooling down."
+                : "Service temporarily unavailable: Scheduled sleep window is active.");
+        const metadata = {
+            ...(decision.earliestAvailableAt ? { earliestAvailableAt: decision.earliestAvailableAt } : {}),
+            ...(decision.reason ? { reason: decision.reason } : {}),
+            ...(decision.wakeAt ? { wakeAt: decision.wakeAt } : {}),
+        };
+
+        this._sendApiFormattedErrorResponse(res, format, status, message, {
+            ...metadata,
+            statusText: status === 429 ? "RESOURCE_EXHAUSTED" : "UNAVAILABLE",
+        });
+    }
+
+    _buildAllAccountsCoolingDownDecision() {
+        const cooledDownIndices = this.authSource.getCooldownIndices();
+        if (cooledDownIndices.length === 0) {
+            return null;
+        }
+
+        if (this.authSource.getRotationIndices().length > 0) {
+            return null;
+        }
+
+        const earliestAvailableAt = this.authSource.getEarliestCooldownExpiry();
+        return {
+            cooledDownIndices,
+            earliestAvailableAt,
+            message: earliestAvailableAt
+                ? `All available accounts are cooling down until ${earliestAvailableAt}.`
+                : "All available accounts are cooling down.",
+            reason: "all_accounts_cooling_down",
+            status: 429,
+        };
+    }
+
+    async _prepareBrowserRecovery(res, format = "generic") {
+        const sleepManager = this._getSleepManager();
+        if (sleepManager) {
+            const decision = await sleepManager.prepareForRecovery();
+            if (!decision.allowed) {
+                this._sendPreflightBlockedResponse(res, format, decision);
+                return false;
+            }
+        }
+
+        return true;
     }
 
     _extractModelFromPath(pathValue) {
@@ -615,10 +758,18 @@ class RequestHandler {
     }
 
     async _performImmediateSwitchRetry(errorDetails, requestId, tracker) {
-        await this.authSwitcher.handleRequestFailureAndSwitch(
+        const switchResult = await this.authSwitcher.handleRequestFailureAndSwitch(
             { message: errorDetails.message, status: Number(errorDetails.status) },
             null
         );
+
+        const shouldWaitForReady = switchResult?.success || switchResult?.reason === "Switch already in progress.";
+        if (!shouldWaitForReady) {
+            this.logger.warn(
+                `[Request] Immediate switch for request #${requestId} stopped: ${switchResult?.reason || "switch_failed"}`
+            );
+            return false;
+        }
 
         const ready = await this._waitForSystemAndConnectionIfBusy(null, {
             sendError: () => {},
@@ -662,7 +813,12 @@ class RequestHandler {
      *
      * @returns {boolean} true if recovery successful, false otherwise
      */
-    async _handleBrowserRecovery(res) {
+    async _handleBrowserRecovery(res, format = "generic") {
+        const recoveryAllowed = await this._prepareBrowserRecovery(res, format);
+        if (!recoveryAllowed) {
+            return false;
+        }
+
         // If within grace period or lightweight reconnect is running, wait up to 60s for WebSocket reconnection
         if (this.connectionRegistry.isInGracePeriod() || this.connectionRegistry.isReconnectingInProgress()) {
             this.logger.info(
@@ -728,7 +884,12 @@ class RequestHandler {
                 const result = await this.authSwitcher.switchToNextAuth();
                 if (!result.success) {
                     this.logger.error(`❌ [System] Failed to switch to available account: ${result.reason}`);
-                    await this._sendErrorResponse(res, 503, `Service temporarily unavailable: ${result.reason}`);
+                    this._sendApiFormattedErrorResponse(
+                        res,
+                        format,
+                        503,
+                        `Service temporarily unavailable: ${result.reason}`
+                    );
                     recoverySuccess = false;
                 } else {
                     this.logger.info(`✅ [System] Successfully recovered to account #${result.newIndex}!`);
@@ -743,8 +904,18 @@ class RequestHandler {
                     recoverySuccess = true;
                 }
             } else {
-                this.logger.error("❌ [System] No available accounts for recovery.");
-                await this._sendErrorResponse(res, 503, "Service temporarily unavailable: No available accounts.");
+                this.logger.error("[System] No rotatable accounts are currently available for recovery.");
+                const cooldownDecision = this._buildAllAccountsCoolingDownDecision();
+                if (cooldownDecision) {
+                    this._sendPreflightBlockedResponse(res, format, cooldownDecision);
+                } else {
+                    this._sendApiFormattedErrorResponse(
+                        res,
+                        format,
+                        503,
+                        "Service temporarily unavailable: No available accounts."
+                    );
+                }
                 recoverySuccess = false;
             }
         } catch (error) {
@@ -759,7 +930,12 @@ class RequestHandler {
                     const result = await this.authSwitcher.switchToNextAuth();
                     if (!result.success) {
                         this.logger.error(`❌ [System] Failed to switch to alternative account: ${result.reason}`);
-                        await this._sendErrorResponse(res, 503, `Service temporarily unavailable: ${result.reason}`);
+                        this._sendApiFormattedErrorResponse(
+                            res,
+                            format,
+                            503,
+                            `Service temporarily unavailable: ${result.reason}`
+                        );
                         recoverySuccess = false;
                     } else {
                         this.logger.info(
@@ -777,15 +953,26 @@ class RequestHandler {
                     }
                 } catch (switchError) {
                     this.logger.error(`❌ [System] All accounts failed: ${switchError.message}`);
-                    await this._sendErrorResponse(res, 503, "Service temporarily unavailable: All accounts failed.");
+                    this._sendApiFormattedErrorResponse(
+                        res,
+                        format,
+                        503,
+                        "Service temporarily unavailable: All accounts failed."
+                    );
                     recoverySuccess = false;
                 }
             } else {
-                await this._sendErrorResponse(
-                    res,
-                    503,
-                    "Service temporarily unavailable: Browser crashed and cannot auto-recover."
-                );
+                const cooldownDecision = this._buildAllAccountsCoolingDownDecision();
+                if (cooldownDecision) {
+                    this._sendPreflightBlockedResponse(res, format, cooldownDecision);
+                } else {
+                    this._sendApiFormattedErrorResponse(
+                        res,
+                        format,
+                        503,
+                        "Service temporarily unavailable: Browser crashed and cannot auto-recover."
+                    );
+                }
                 recoverySuccess = false;
             }
         } finally {
@@ -807,6 +994,7 @@ class RequestHandler {
             requestCategory: this._categorizeRequest(req.path, "request"),
         });
         res.__proxyResponseStreamMode = null;
+        let browserActivityStarted = false;
 
         try {
             const isGenerativeRequest = this._isGeminiGenerativeRequest(req);
@@ -818,10 +1006,15 @@ class RequestHandler {
                 return;
             }
 
+            browserActivityStarted = await this._beginBrowserBoundRequest(res, "generic");
+            if (!browserActivityStarted) {
+                return;
+            }
+
             // Check current account's browser connection
             if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
                 this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
+                const recovered = await this._handleBrowserRecovery(res, "generic");
                 if (!recovered) {
                     this._markTrackedEarlyExitIfNeeded(
                         res,
@@ -839,10 +1032,6 @@ class RequestHandler {
                     return;
                 }
             }
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
-            }
-
             const proxyRequest = this._buildProxyRequest(req, requestId);
             proxyRequest.is_generative = isGenerativeRequest;
             this._initializeProxyRequestAttempt(proxyRequest);
@@ -905,6 +1094,7 @@ class RequestHandler {
                 if (!res.writableEnded) res.end();
             }
         } finally {
+            await this._endBrowserBoundRequest(browserActivityStarted);
             this._finalizeTrackedRequest(requestId, res);
         }
     }
@@ -919,12 +1109,18 @@ class RequestHandler {
             requestCategory: "upload",
             streamMode: null,
         });
+        let browserActivityStarted = false;
 
         try {
+            browserActivityStarted = await this._beginBrowserBoundRequest(res, "generic");
+            if (!browserActivityStarted) {
+                return;
+            }
+
             // Check current account's browser connection
             if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
                 this.logger.warn(`[Upload] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
+                const recovered = await this._handleBrowserRecovery(res, "generic");
                 if (!recovered) {
                     this._markTrackedEarlyExitIfNeeded(
                         res,
@@ -941,10 +1137,6 @@ class RequestHandler {
                     this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
                     return;
                 }
-            }
-
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
             }
 
             const proxyRequest = {
@@ -979,6 +1171,7 @@ class RequestHandler {
                 if (!res.writableEnded) res.end();
             }
         } finally {
+            await this._endBrowserBoundRequest(browserActivityStarted);
             this._finalizeTrackedRequest(requestId, res);
         }
     }
@@ -993,12 +1186,18 @@ class RequestHandler {
             streamMode: req.body.stream === true ? this.serverSystem.streamingMode : null,
         });
         res.__proxyResponseStreamMode = null;
+        let browserActivityStarted = false;
 
         try {
+            browserActivityStarted = await this._beginBrowserBoundRequest(res, "openai");
+            if (!browserActivityStarted) {
+                return;
+            }
+
             // Check current account's browser connection
             if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
                 this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
+                const recovered = await this._handleBrowserRecovery(res, "openai");
                 if (!recovered) {
                     this._markTrackedEarlyExitIfNeeded(
                         res,
@@ -1016,10 +1215,6 @@ class RequestHandler {
                     return;
                 }
             }
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
-            }
-
             const isOpenAIStream = req.body.stream === true;
             const systemStreamMode = this.serverSystem.streamingMode;
 
@@ -1324,6 +1519,7 @@ class RequestHandler {
                 if (!res.writableEnded) res.end();
             }
         } finally {
+            await this._endBrowserBoundRequest(browserActivityStarted);
             this._finalizeTrackedRequest(requestId, res);
         }
     }
@@ -1338,12 +1534,18 @@ class RequestHandler {
             streamMode: req.body.stream === true ? this.serverSystem.streamingMode : null,
         });
         res.__proxyResponseStreamMode = null;
+        let browserActivityStarted = false;
 
         try {
+            browserActivityStarted = await this._beginBrowserBoundRequest(res, "response_api");
+            if (!browserActivityStarted) {
+                return;
+            }
+
             // Check current account's browser connection
             if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
                 this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
+                const recovered = await this._handleBrowserRecovery(res, "response_api");
                 if (!recovered) {
                     this._markTrackedEarlyExitIfNeeded(
                         res,
@@ -1361,10 +1563,6 @@ class RequestHandler {
                     return;
                 }
             }
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
-            }
-
             const isOpenAIStream = req.body.stream === true;
             const normalizeInstructions = value => {
                 if (typeof value === "string") return value;
@@ -1736,6 +1934,7 @@ class RequestHandler {
                 if (!res.writableEnded) res.end();
             }
         } finally {
+            await this._endBrowserBoundRequest(browserActivityStarted);
             this._finalizeTrackedRequest(requestId, res);
         }
     }
@@ -1750,12 +1949,18 @@ class RequestHandler {
             streamMode: req.body.stream === true ? this.serverSystem.streamingMode : null,
         });
         res.__proxyResponseStreamMode = null;
+        let browserActivityStarted = false;
 
         try {
+            browserActivityStarted = await this._beginBrowserBoundRequest(res, "claude");
+            if (!browserActivityStarted) {
+                return;
+            }
+
             // Check current account's browser connection
             if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
                 this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
+                const recovered = await this._handleBrowserRecovery(res, "claude");
                 if (!recovered) {
                     this._markTrackedEarlyExitIfNeeded(
                         res,
@@ -1775,10 +1980,6 @@ class RequestHandler {
                     this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
                     return;
                 }
-            }
-
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
             }
 
             const isClaudeStream = req.body.stream === true;
@@ -2085,6 +2286,7 @@ class RequestHandler {
                 if (!res.writableEnded) res.end();
             }
         } finally {
+            await this._endBrowserBoundRequest(browserActivityStarted);
             this._finalizeTrackedRequest(requestId, res);
         }
     }
@@ -2098,12 +2300,18 @@ class RequestHandler {
             requestCategory: "count_tokens",
             streamMode: null,
         });
+        let browserActivityStarted = false;
 
         try {
+            browserActivityStarted = await this._beginBrowserBoundRequest(res, "claude");
+            if (!browserActivityStarted) {
+                return;
+            }
+
             // Check current account's browser connection
             if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
                 this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
+                const recovered = await this._handleBrowserRecovery(res, "claude");
                 if (!recovered) {
                     this._markTrackedEarlyExitIfNeeded(
                         res,
@@ -2123,10 +2331,6 @@ class RequestHandler {
                     this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
                     return;
                 }
-            }
-
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
             }
 
             // Translate Claude format to Google format
@@ -2244,6 +2448,7 @@ class RequestHandler {
                 if (!res.writableEnded) res.end();
             }
         } finally {
+            await this._endBrowserBoundRequest(browserActivityStarted);
             this._finalizeTrackedRequest(requestId, res);
         }
     }
@@ -2258,12 +2463,18 @@ class RequestHandler {
             requestCategory: "count_tokens",
             streamMode: null,
         });
+        let browserActivityStarted = false;
 
         try {
+            browserActivityStarted = await this._beginBrowserBoundRequest(res, "response_api");
+            if (!browserActivityStarted) {
+                return;
+            }
+
             // Check current account's browser connection
             if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
                 this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
+                const recovered = await this._handleBrowserRecovery(res, "response_api");
                 if (!recovered) {
                     this._markTrackedEarlyExitIfNeeded(
                         res,
@@ -2280,10 +2491,6 @@ class RequestHandler {
                     this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
                     return;
                 }
-            }
-
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
             }
 
             // Translate OpenAI Response format to Google format (so we can use Gemini countTokens)
@@ -2409,6 +2616,7 @@ class RequestHandler {
                 if (!res.writableEnded) res.end();
             }
         } finally {
+            await this._endBrowserBoundRequest(browserActivityStarted);
             this._finalizeTrackedRequest(requestId, res);
         }
     }
@@ -2525,7 +2733,7 @@ class RequestHandler {
         }
     }
 
-    _sendClaudeErrorResponse(res, status, errorType, message) {
+    _sendClaudeErrorResponse(res, status, errorType, message, details = {}) {
         if (!res.headersSent) {
             this._markTrackedResponseError(res, message, status || 500);
             res.status(status)
@@ -2533,6 +2741,7 @@ class RequestHandler {
                 .send(
                     JSON.stringify({
                         error: {
+                            ...details,
                             message,
                             type: errorType,
                         },
@@ -3805,14 +4014,22 @@ class RequestHandler {
         }
     }
 
-    _sendErrorResponse(res, status, message) {
+    _sendErrorResponse(res, status, message, details = {}) {
         if (!res.headersSent) {
             this._markTrackedResponseError(res, message, status || 500);
+            const { statusText, ...extraFields } = details;
             const errorPayload = {
                 error: {
                     code: status || 500,
                     message,
-                    status: "SERVICE_UNAVAILABLE",
+                    status:
+                        statusText ||
+                        (status === 429
+                            ? "RESOURCE_EXHAUSTED"
+                            : status === 503
+                              ? "UNAVAILABLE"
+                              : "SERVICE_UNAVAILABLE"),
+                    ...extraFields,
                 },
             };
             res.status(status || 500)

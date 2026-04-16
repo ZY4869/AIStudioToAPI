@@ -5,6 +5,8 @@
  * Author: Ellinav, iBenzene, bbbugg
  */
 
+const { classifyQuotaCooldown } = require("../utils/QuotaCooldownClassifier");
+
 /**
  * Authentication Switcher Module
  * Handles account switching logic including single/multi-account modes and fallback mechanisms
@@ -28,27 +30,6 @@ class AuthSwitcher {
         this.browserManager.currentAuthIndex = value;
     }
 
-    // getNextAuthIndex() {
-    //     const available = this.authSource.getRotationIndices();
-    //     if (available.length === 0) return null;
-
-    //     const currentCanonicalIndex =
-    //         this.currentAuthIndex >= 0
-    //             ? this.authSource.getCanonicalIndex(this.currentAuthIndex)
-    //             : this.currentAuthIndex;
-    //     const currentIndexInArray = available.indexOf(currentCanonicalIndex);
-
-    //     if (currentIndexInArray === -1) {
-    //         this.logger.warn(
-    //             `[Auth] Current index ${this.currentAuthIndex} not in available list, switching to first available index.`
-    //         );
-    //         return available[0];
-    //     }
-
-    //     const nextIndexInArray = (currentIndexInArray + 1) % available.length;
-    //     return available[nextIndexInArray];
-    // }
-
     async switchToNextAuth() {
         const available = this.authSource.getRotationIndices();
 
@@ -57,21 +38,20 @@ class AuthSwitcher {
         }
 
         if (this.isSystemBusy) {
-            this.logger.info("🔄 [Auth] Account switching/restarting in progress, skipping duplicate operation");
+            this.logger.info("[Auth] Account switching/restarting in progress, skipping duplicate operation");
             return { reason: "Switch already in progress.", success: false };
         }
 
         this.isSystemBusy = true;
 
         try {
-            // Single account mode
             if (available.length === 1) {
                 const singleIndex = available[0];
                 this.logger.info("==================================================");
                 this.logger.info(
-                    `🔄 [Auth] Single account mode: Rotation threshold reached, performing in-place restart...`
+                    "[Auth] Single account mode: Rotation threshold reached, performing in-place restart..."
                 );
-                this.logger.info(`   • Target account: #${singleIndex}`);
+                this.logger.info(`   - Target account: #${singleIndex}`);
                 this.logger.info("==================================================");
 
                 try {
@@ -82,16 +62,15 @@ class AuthSwitcher {
                     });
 
                     this.logger.info(
-                        `✅ [Auth] Single account #${singleIndex} restart/refresh successful, usage count reset.`
+                        `[Auth] Single account #${singleIndex} restart/refresh successful, usage count reset.`
                     );
                     return { newIndex: singleIndex, success: true };
                 } catch (error) {
-                    this.logger.error(`❌ [Auth] Single account restart failed: ${error.message}`);
+                    this.logger.error(`[Auth] Single account restart failed: ${error.message}`);
                     throw new Error(`Only one account is available and restart failed: ${error.message}`);
                 }
             }
 
-            // Multi-account mode
             const currentCanonicalIndex =
                 this.currentAuthIndex >= 0
                     ? this.authSource.getCanonicalIndex(this.currentAuthIndex)
@@ -102,21 +81,19 @@ class AuthSwitcher {
             const originalStartAccount = hasCurrentAccount ? available[startIndex] : null;
 
             this.logger.info("==================================================");
-            this.logger.info(`🔄 [Auth] Multi-account mode: Starting intelligent account switching`);
-            this.logger.info(`   • Current account: #${this.currentAuthIndex}`);
+            this.logger.info("[Auth] Multi-account mode: Starting intelligent account switching");
+            this.logger.info(`   - Current account: #${this.currentAuthIndex}`);
             this.logger.info(
-                `   • Available accounts (dedup by email, keeping latest index): [${available.join(", ")}]`
+                `   - Available accounts (dedup by email, keeping latest index): [${available.join(", ")}]`
             );
             if (hasCurrentAccount) {
-                this.logger.info(`   • Starting from: #${originalStartAccount}`);
+                this.logger.info(`   - Starting from: #${originalStartAccount}`);
             } else {
-                this.logger.info(`   • No current account, will try all available accounts`);
+                this.logger.info("   - No current account, will try all available accounts");
             }
             this.logger.info("==================================================");
 
             const failedAccounts = [];
-            // If no current account (currentAuthIndex=-1), start from i=0 to try all accounts
-            // If has current account, start from i=1 to skip current and try others
             const startOffset = hasCurrentAccount ? 1 : 0;
             const tryCount = hasCurrentAccount ? available.length - 1 : available.length;
 
@@ -126,11 +103,10 @@ class AuthSwitcher {
 
                 const attemptNumber = i - startOffset + 1;
                 this.logger.info(
-                    `🔄 [Auth] Attempting to switch to account #${accountIndex} (${attemptNumber}/${tryCount} accounts)...`
+                    `[Auth] Attempting to switch to account #${accountIndex} (${attemptNumber}/${tryCount} accounts)...`
                 );
 
                 try {
-                    // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
                     await this.browserManager.preCleanupForSwitch(accountIndex);
                     await this.browserManager.switchAccount(accountIndex);
                     this.resetCounters();
@@ -140,41 +116,34 @@ class AuthSwitcher {
 
                     if (failedAccounts.length > 0) {
                         this.logger.info(
-                            `✅ [Auth] Successfully switched to account #${accountIndex} after skipping failed accounts: [${failedAccounts.join(", ")}]`
+                            `[Auth] Successfully switched to account #${accountIndex} after skipping failed accounts: [${failedAccounts.join(", ")}]`
                         );
                     } else {
-                        this.logger.info(
-                            `✅ [Auth] Successfully switched to account #${accountIndex}, counters reset.`
-                        );
+                        this.logger.info(`[Auth] Successfully switched to account #${accountIndex}, counters reset.`);
                     }
 
                     return { failedAccounts, newIndex: accountIndex, success: true };
                 } catch (error) {
-                    this.logger.error(`❌ [Auth] Account #${accountIndex} failed: ${error.message}`);
+                    this.logger.error(`[Auth] Account #${accountIndex} failed: ${error.message}`);
                     failedAccounts.push(accountIndex);
                 }
             }
 
-            // If we had a current account, try it as a final fallback
-            // If we had no current account, we already tried all accounts, so skip fallback
             if (hasCurrentAccount && originalStartAccount !== null) {
                 this.logger.warn("==================================================");
                 this.logger.warn(
-                    `⚠️ [Auth] All other accounts failed. Making final attempt with original starting account #${originalStartAccount}...`
+                    `[Auth] All other accounts failed. Making final attempt with original starting account #${originalStartAccount}...`
                 );
                 this.logger.warn("==================================================");
 
                 try {
-                    // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
                     await this.browserManager.preCleanupForSwitch(originalStartAccount);
                     await this.browserManager.switchAccount(originalStartAccount);
                     this.resetCounters();
                     this.browserManager.rebalanceContextPool().catch(err => {
                         this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
                     });
-                    this.logger.info(
-                        `✅ [Auth] Final attempt succeeded! Switched to account #${originalStartAccount}.`
-                    );
+                    this.logger.info(`[Auth] Final attempt succeeded! Switched to account #${originalStartAccount}.`);
                     return {
                         failedAccounts,
                         finalAttempt: true,
@@ -183,11 +152,9 @@ class AuthSwitcher {
                     };
                 } catch (finalError) {
                     this.logger.error(
-                        `FATAL: ❌❌❌ [Auth] Final attempt with account #${originalStartAccount} also failed!`
+                        `[Auth] Final attempt with account #${originalStartAccount} also failed: ${finalError.message}`
                     );
                     failedAccounts.push(originalStartAccount);
-
-                    // Throw fallback failure error with detailed information
                     this.currentAuthIndex = -1;
                     throw new Error(
                         `Fallback failed reason: All accounts failed including fallback to #${originalStartAccount}. Failed accounts: [${failedAccounts.join(", ")}]`
@@ -195,9 +162,8 @@ class AuthSwitcher {
                 }
             }
 
-            // All accounts failed
             this.logger.error(
-                `FATAL: All ${available.length} accounts failed! Failed accounts: [${failedAccounts.join(", ")}]`
+                `All ${available.length} accounts failed! Failed accounts: [${failedAccounts.join(", ")}]`
             );
             this.currentAuthIndex = -1;
             throw new Error(
@@ -210,12 +176,10 @@ class AuthSwitcher {
 
     async switchToSpecificAuth(targetIndex) {
         if (this.isSystemBusy) {
-            this.logger.info("🔄 [Auth] Account switching in progress, skipping duplicate operation");
+            this.logger.info("[Auth] Account switching in progress, skipping duplicate operation");
             return { reason: "Switch already in progress.", success: false };
         }
 
-        // For manual switch, respect user's choice - don't auto-redirect to canonical index
-        // UI already shows duplicate indicator, so user is making a deliberate choice
         if (!this.authSource.availableIndices.includes(targetIndex)) {
             return {
                 reason: `Switch failed: Account #${targetIndex} invalid or does not exist.`,
@@ -225,18 +189,17 @@ class AuthSwitcher {
 
         this.isSystemBusy = true;
         try {
-            this.logger.info(`🔄 [Auth] Starting switch to specified account #${targetIndex}...`);
-            // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
+            this.logger.info(`[Auth] Starting switch to specified account #${targetIndex}...`);
             await this.browserManager.preCleanupForSwitch(targetIndex);
             await this.browserManager.switchAccount(targetIndex);
             this.resetCounters();
             this.browserManager.rebalanceContextPool().catch(err => {
                 this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
             });
-            this.logger.info(`✅ [Auth] Successfully switched to account #${targetIndex}, counters reset.`);
+            this.logger.info(`[Auth] Successfully switched to account #${targetIndex}, counters reset.`);
             return { newIndex: targetIndex, success: true };
         } catch (error) {
-            this.logger.error(`❌ [Auth] Switch to specified account #${targetIndex} failed: ${error.message}`);
+            this.logger.error(`[Auth] Switch to specified account #${targetIndex} failed: ${error.message}`);
             throw error;
         } finally {
             this.isSystemBusy = false;
@@ -244,14 +207,19 @@ class AuthSwitcher {
     }
 
     async handleRequestFailureAndSwitch(errorDetails, sendErrorCallback) {
+        const cooldownDecision = classifyQuotaCooldown(errorDetails, this.config.quotaCooldownMinutes);
+        if (cooldownDecision.isCooldown) {
+            return this._handleQuotaCooldown(cooldownDecision, sendErrorCallback);
+        }
+
         this.failureCount++;
         if (this.config.failureThreshold > 0) {
             this.logger.warn(
-                `⚠️ [Auth] Request failed - failure count: ${this.failureCount}/${this.config.failureThreshold} (Current account index: ${this.currentAuthIndex})`
+                `[Auth] Request failed - failure count: ${this.failureCount}/${this.config.failureThreshold} (Current account index: ${this.currentAuthIndex})`
             );
         } else {
             this.logger.warn(
-                `⚠️ [Auth] Request failed - failure count: ${this.failureCount} (Current account index: ${this.currentAuthIndex})`
+                `[Auth] Request failed - failure count: ${this.failureCount} (Current account index: ${this.currentAuthIndex})`
             );
         }
 
@@ -262,42 +230,111 @@ class AuthSwitcher {
         if (isImmediateSwitch || isThresholdReached) {
             if (isImmediateSwitch) {
                 this.logger.warn(
-                    `🔴 [Auth] Received status code ${errorDetails.status}, triggering immediate account switch...`
+                    `[Auth] Received status code ${errorDetails.status}, triggering immediate account switch...`
                 );
             } else {
                 this.logger.warn(
-                    `🔴 [Auth] Failure threshold reached (${this.failureCount}/${this.config.failureThreshold})! Preparing to switch account...`
+                    `[Auth] Failure threshold reached (${this.failureCount}/${this.config.failureThreshold})! Preparing to switch account...`
                 );
             }
 
             try {
                 const result = await this.switchToNextAuth();
                 if (!result.success) {
-                    this.logger.warn(`⚠️ [Auth] Account switch skipped: ${result.reason}`);
+                    this.logger.warn(`[Auth] Account switch skipped: ${result.reason}`);
                     if (sendErrorCallback) {
-                        sendErrorCallback(`⚠️ Account switch skipped: ${result.reason}`);
+                        sendErrorCallback(`[Auth] Account switch skipped: ${result.reason}`);
                     }
-                    return;
+                    return result;
                 }
-                const successMessage = `🔄 Account switch completed, now using account #${this.currentAuthIndex}.`;
-                this.logger.info(`[Auth] ${successMessage}`);
+                const successMessage = `[Auth] Account switch completed, now using account #${this.currentAuthIndex}.`;
+                this.logger.info(successMessage);
                 if (sendErrorCallback) sendErrorCallback(successMessage);
+                return result;
             } catch (error) {
-                let userMessage = `❌ Fatal error: Unknown switching error occurred: ${error.message}`;
+                let userMessage = `Fatal error: Unknown switching error occurred: ${error.message}`;
 
                 if (error.message.includes("Only one account is available")) {
-                    userMessage = "❌ Switch failed: Only one account available.";
+                    userMessage = "Switch failed: Only one account available.";
                     this.logger.info("[Auth] Only one account available, failure count reset.");
                     this.failureCount = 0;
                 } else if (error.message.includes("Fallback failed reason")) {
-                    userMessage = `❌ Fatal error: Both automatic switching and emergency fallback failed, service may be interrupted, please check logs!`;
+                    userMessage =
+                        "Fatal error: Both automatic switching and emergency fallback failed, service may be interrupted, please check logs!";
                 } else if (error.message.includes("Switching to account")) {
-                    userMessage = `⚠️ Automatic switch failed: Automatically fell back to account #${this.currentAuthIndex}, please check if target account has issues.`;
+                    userMessage = `Automatic switch failed: Automatically fell back to account #${this.currentAuthIndex}, please check if target account has issues.`;
                 }
 
                 this.logger.error(`[Auth] Background account switching task failed: ${error.message}`);
                 if (sendErrorCallback) sendErrorCallback(userMessage);
+                return { reason: error.message, success: false };
             }
+        }
+
+        return { success: false };
+    }
+
+    async _handleQuotaCooldown(cooldownDecision, sendErrorCallback) {
+        const currentIndex = this.currentAuthIndex;
+        if (!Number.isInteger(currentIndex) || currentIndex < 0) {
+            this.logger.warn("[Auth] Quota cooldown detected but there is no active account to cool down.");
+            return { reason: "no_active_account", success: false };
+        }
+
+        this.logger.warn(
+            `[Auth] Quota exhaustion detected for account #${currentIndex}. Cooling down until ${cooldownDecision.cooldownUntil}.`
+        );
+
+        await this.authSource.markAsCooldown(currentIndex, cooldownDecision.cooldownUntil, cooldownDecision.reason);
+        this.resetCounters();
+
+        try {
+            await this.browserManager.closeContext(currentIndex);
+        } catch (error) {
+            this.logger.warn(`[Auth] Failed to close cooling account #${currentIndex}: ${error.message}`);
+        }
+
+        this.browserManager.rebalanceContextPool().catch(error => {
+            this.logger.error(`[Auth] Background rebalance failed after cooldown: ${error.message}`);
+        });
+
+        const remainingAccounts = this.authSource.getRotationIndices();
+        if (remainingAccounts.length === 0) {
+            const message = `All available accounts are cooling down until ${cooldownDecision.cooldownUntil}.`;
+            this.logger.warn(`[Auth] ${message}`);
+            if (sendErrorCallback) sendErrorCallback(message);
+            return {
+                cooldownUntil: cooldownDecision.cooldownUntil,
+                reason: "all_accounts_cooling_down",
+                success: false,
+            };
+        }
+
+        try {
+            const result = await this.switchToNextAuth();
+            if (result.success) {
+                const successMessage = `Account #${currentIndex} cooled down. Switched to account #${result.newIndex}.`;
+                this.logger.info(`[Auth] ${successMessage}`);
+                if (sendErrorCallback) sendErrorCallback(successMessage);
+                return {
+                    cooldownUntil: cooldownDecision.cooldownUntil,
+                    newIndex: result.newIndex,
+                    success: true,
+                };
+            }
+
+            return {
+                cooldownUntil: cooldownDecision.cooldownUntil,
+                reason: result.reason,
+                success: false,
+            };
+        } catch (error) {
+            this.logger.error(`[Auth] Failed to switch away from cooling account #${currentIndex}: ${error.message}`);
+            return {
+                cooldownUntil: cooldownDecision.cooldownUntil,
+                reason: error.message,
+                success: false,
+            };
         }
     }
 

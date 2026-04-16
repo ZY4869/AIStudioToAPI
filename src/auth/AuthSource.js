@@ -24,6 +24,7 @@ class AuthSource {
         this.duplicateIndices = [];
         // Expired auth indices (valid JSON but marked as expired, excluded from rotation)
         this.expiredIndices = [];
+        this.cooldownInfoMap = new Map();
         this.initialIndices = [];
         this.accountNameMap = new Map();
         // Map any valid index -> canonical (latest) index for the same account email
@@ -47,9 +48,10 @@ class AuthSource {
         const oldIndices = this.lastScannedIndices;
         this._discoverAvailableIndices();
         const newIndices = JSON.stringify(this.initialIndices);
+        const cooldownsCleared = this.cleanupExpiredCooldowns();
 
         // Only log verbosely if it's the first load or if the file list has actually changed.
-        if (isInitialLoad || oldIndices !== newIndices) {
+        if (isInitialLoad || oldIndices !== newIndices || cooldownsCleared.length > 0) {
             this.logger.info(`[Auth] Auth file scan detected changes. Reloading and re-validating...`);
             this._preValidateAndFilter();
             this.logger.info(
@@ -111,6 +113,7 @@ class AuthSource {
             this.rotationIndices = [];
             this.duplicateIndices = [];
             this.expiredIndices = [];
+            this.cooldownInfoMap.clear();
             this.accountNameMap.clear();
             this.canonicalIndexMap.clear();
             this.duplicateGroups = [];
@@ -121,6 +124,7 @@ class AuthSource {
         const invalidSourceDescriptions = [];
         this.accountNameMap.clear(); // Clear old names before re-validating
         this.canonicalIndexMap.clear();
+        this.cooldownInfoMap.clear();
         this.duplicateGroups = [];
         this.expiredIndices = [];
 
@@ -135,6 +139,16 @@ class AuthSource {
                     // Track expired status from auth file
                     if (authData.expired === true) {
                         this.expiredIndices.push(index);
+                    }
+                    if (typeof authData.cooldownUntil === "string") {
+                        const cooldownUntil = new Date(authData.cooldownUntil);
+                        if (!Number.isNaN(cooldownUntil.getTime()) && cooldownUntil.getTime() > Date.now()) {
+                            this.cooldownInfoMap.set(index, {
+                                cooldownReason: authData.cooldownReason || null,
+                                cooldownUntil: cooldownUntil.toISOString(),
+                                lastCooldownAt: authData.lastCooldownAt || null,
+                            });
+                        }
                     }
                 } catch (e) {
                     invalidSourceDescriptions.push(`auth-${index} (parse error)`);
@@ -176,10 +190,12 @@ class AuthSource {
 
         const emailKeyToIndices = new Map();
 
-        // Only process non-expired accounts for rotation and deduplication
-        const nonExpiredIndices = this.availableIndices.filter(idx => !this.expiredIndices.includes(idx));
+        // Only process non-expired and non-cooling accounts for rotation and deduplication
+        const rotatableIndices = this.availableIndices.filter(
+            idx => !this.expiredIndices.includes(idx) && !this.cooldownInfoMap.has(idx)
+        );
 
-        for (const index of nonExpiredIndices) {
+        for (const index of rotatableIndices) {
             const accountName = this.accountNameMap.get(index);
             const emailKey = this._normalizeEmailKey(accountName);
 
@@ -233,6 +249,14 @@ class AuthSource {
                     `These accounts are excluded from automatic rotation.`
             );
         }
+
+        if (this.cooldownInfoMap.size > 0) {
+            this.logger.warn(
+                `[Auth] Detected ${this.cooldownInfoMap.size} cooling auth files: [${[
+                    ...this.cooldownInfoMap.keys(),
+                ].join(", ")}]. These accounts are excluded from automatic rotation.`
+            );
+        }
     }
 
     _getAuthContent(index) {
@@ -246,6 +270,7 @@ class AuthSource {
     }
 
     getAuth(index) {
+        this.cleanupExpiredCooldowns();
         if (!this.availableIndices.includes(index)) {
             this.logger.error(`[Auth] Requested invalid or non-existent authentication index: ${index}`);
             return null;
@@ -266,10 +291,12 @@ class AuthSource {
     }
 
     getRotationIndices() {
+        this.cleanupExpiredCooldowns();
         return this.rotationIndices;
     }
 
     getCanonicalIndex(index) {
+        this.cleanupExpiredCooldowns();
         if (!Number.isInteger(index)) return null;
         if (!this.availableIndices.includes(index)) return null;
         return this.canonicalIndexMap.get(index) ?? index;
@@ -277,6 +304,165 @@ class AuthSource {
 
     getDuplicateGroups() {
         return this.duplicateGroups;
+    }
+
+    getCooldownIndices() {
+        this.cleanupExpiredCooldowns();
+        return [...this.cooldownInfoMap.keys()].sort((a, b) => a - b);
+    }
+
+    getCooldownInfo(index) {
+        this.cleanupExpiredCooldowns();
+        return this.cooldownInfoMap.get(index) || null;
+    }
+
+    getEarliestCooldownExpiry() {
+        this.cleanupExpiredCooldowns();
+        let earliest = null;
+        for (const info of this.cooldownInfoMap.values()) {
+            if (!info?.cooldownUntil) continue;
+            if (!earliest || new Date(info.cooldownUntil).getTime() < new Date(earliest).getTime()) {
+                earliest = info.cooldownUntil;
+            }
+        }
+        return earliest;
+    }
+
+    isCoolingDown(index) {
+        this.cleanupExpiredCooldowns();
+        return this.cooldownInfoMap.has(index);
+    }
+
+    _getCooldownSiblingIndices(index) {
+        const accountName = this.accountNameMap.get(index);
+        const emailKey = this._normalizeEmailKey(accountName);
+        if (!emailKey) {
+            return [index];
+        }
+
+        return this.availableIndices.filter(
+            candidate => this._normalizeEmailKey(this.accountNameMap.get(candidate)) === emailKey
+        );
+    }
+
+    _updateAuthFileSync(index, updater) {
+        const authFilePath = path.join(process.cwd(), "configs", "auth", `auth-${index}.json`);
+        const authData = JSON.parse(fs.readFileSync(authFilePath, "utf-8"));
+        updater(authData);
+        fs.writeFileSync(authFilePath, JSON.stringify(authData, null, 2));
+    }
+
+    cleanupExpiredCooldowns() {
+        if (this.cooldownInfoMap.size === 0) return [];
+
+        const now = Date.now();
+        const clearedIndices = [];
+
+        for (const [index, info] of [...this.cooldownInfoMap.entries()]) {
+            const cooldownUntil = new Date(info.cooldownUntil).getTime();
+            if (!Number.isFinite(cooldownUntil) || cooldownUntil > now) {
+                continue;
+            }
+
+            try {
+                this._updateAuthFileSync(index, authData => {
+                    delete authData.cooldownReason;
+                    delete authData.cooldownUntil;
+                    delete authData.lastCooldownAt;
+                });
+            } catch (error) {
+                this.logger.warn(`[Auth] Failed to clear cooldown for auth #${index}: ${error.message}`);
+                continue;
+            }
+
+            this.cooldownInfoMap.delete(index);
+            clearedIndices.push(index);
+        }
+
+        if (clearedIndices.length > 0) {
+            this._buildRotationIndices();
+            this.logger.info(`[Auth] Cooldown expired for auth files: [${clearedIndices.join(", ")}].`);
+        }
+
+        return clearedIndices;
+    }
+
+    async markAsCooldown(index, cooldownUntil, cooldownReason) {
+        this.cleanupExpiredCooldowns();
+
+        if (!this.availableIndices.includes(index)) {
+            this.logger.warn(`[Auth] Cannot mark non-existent auth #${index} as cooling down`);
+            return { markedIndices: [], updated: false };
+        }
+
+        const until = new Date(cooldownUntil);
+        if (Number.isNaN(until.getTime())) {
+            throw new Error(`Invalid cooldownUntil for auth #${index}: ${cooldownUntil}`);
+        }
+
+        const indicesToMark = this._getCooldownSiblingIndices(index);
+        const lastCooldownAt = new Date().toISOString();
+        const markedIndices = [];
+
+        for (const targetIndex of indicesToMark) {
+            const existingInfo = this.cooldownInfoMap.get(targetIndex);
+            const existingUntil = existingInfo?.cooldownUntil ? new Date(existingInfo.cooldownUntil) : null;
+            const effectiveUntil =
+                existingUntil && existingUntil.getTime() > until.getTime()
+                    ? existingUntil.toISOString()
+                    : until.toISOString();
+
+            const authFilePath = path.join(process.cwd(), "configs", "auth", `auth-${targetIndex}.json`);
+            const fileContent = await fsPromises.readFile(authFilePath, "utf-8");
+            const authData = JSON.parse(fileContent);
+            authData.cooldownReason = cooldownReason;
+            authData.cooldownUntil = effectiveUntil;
+            authData.lastCooldownAt = lastCooldownAt;
+            await fsPromises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
+
+            this.cooldownInfoMap.set(targetIndex, {
+                cooldownReason,
+                cooldownUntil: effectiveUntil,
+                lastCooldownAt,
+            });
+            markedIndices.push(targetIndex);
+        }
+
+        this._buildRotationIndices();
+        this.logger.warn(
+            `[Auth] Marked auth files [${markedIndices.join(", ")}] as cooling down until ${until.toISOString()} (${cooldownReason}).`
+        );
+
+        return { cooldownUntil: until.toISOString(), markedIndices, updated: markedIndices.length > 0 };
+    }
+
+    async clearCooldown(index) {
+        this.cleanupExpiredCooldowns();
+
+        if (!this.availableIndices.includes(index)) {
+            return false;
+        }
+
+        const indicesToClear = this._getCooldownSiblingIndices(index).filter(targetIndex =>
+            this.cooldownInfoMap.has(targetIndex)
+        );
+        if (indicesToClear.length === 0) {
+            return false;
+        }
+
+        for (const targetIndex of indicesToClear) {
+            const authFilePath = path.join(process.cwd(), "configs", "auth", `auth-${targetIndex}.json`);
+            const fileContent = await fsPromises.readFile(authFilePath, "utf-8");
+            const authData = JSON.parse(fileContent);
+            delete authData.cooldownReason;
+            delete authData.cooldownUntil;
+            delete authData.lastCooldownAt;
+            await fsPromises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
+            this.cooldownInfoMap.delete(targetIndex);
+        }
+
+        this._buildRotationIndices();
+        return true;
     }
 
     /**

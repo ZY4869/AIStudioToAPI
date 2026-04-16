@@ -305,6 +305,15 @@ class BrowserManager {
         }
     }
 
+    async saveAuthState(authIndex = this._currentAuthIndex) {
+        if (!Number.isInteger(authIndex) || authIndex < 0) {
+            return false;
+        }
+
+        await this._updateAuthFile(authIndex);
+        return true;
+    }
+
     /**
      * Get pool target indices based on current account and rotation order
      * @param {number} maxContexts - Max pool size (0 = unlimited)

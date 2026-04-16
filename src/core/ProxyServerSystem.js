@@ -20,6 +20,7 @@ const AuthSource = require("../auth/AuthSource");
 const BrowserManager = require("./BrowserManager");
 const ConnectionRegistry = require("./ConnectionRegistry");
 const RequestHandler = require("./RequestHandler");
+const SleepManager = require("./SleepManager");
 const UsageStatsService = require("./UsageStatsService");
 const ConfigLoader = require("../utils/ConfigLoader");
 const WebRoutes = require("../routes/WebRoutes");
@@ -111,6 +112,8 @@ class ProxyServerSystem extends EventEmitter {
             this.config,
             this.authSource
         );
+        this.sleepManager = new SleepManager(this.logger, this.config, this.browserManager, this.authSource);
+        this.sleepManager.setRequestHandler(this.requestHandler);
 
         this.httpServer = null;
         this.wsServer = null;
@@ -122,6 +125,8 @@ class ProxyServerSystem extends EventEmitter {
         await this._startHttpServer();
         await this._startWebSocketServer();
         this.logger.info(`[System] Proxy server system startup complete.`);
+        this.sleepManager.start();
+        await this.sleepManager.runHeartbeat();
 
         // Start periodic cleanup of stale message queues (every 5 minutes)
         // This is a safety mechanism to prevent queue leaks from race conditions
@@ -140,6 +145,14 @@ class ProxyServerSystem extends EventEmitter {
             this.logger.warn("[System] No available authentication source. Starting in account binding mode.");
             this.emit("started");
             return; // Exit early
+        }
+
+        if (this.sleepManager.isInScheduledSleepWindow()) {
+            this.logger.info("[System] Scheduled sleep window is active. Skipping browser/context warmup.");
+            this.sleepManager.isSleeping = true;
+            this.sleepManager.sleepReason = "schedule";
+            this.emit("started");
+            return;
         }
 
         // Determine startup order
@@ -623,6 +636,10 @@ class ProxyServerSystem extends EventEmitter {
             clearInterval(this.staleQueueCleanupInterval);
             this.staleQueueCleanupInterval = null;
             this.logger.info("[System] Stopped stale queue cleanup interval");
+        }
+
+        if (this.sleepManager) {
+            this.sleepManager.stop();
         }
 
         // Close all message queues

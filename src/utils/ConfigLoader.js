@@ -18,10 +18,53 @@ class ConfigLoader {
         this.logger = logger;
     }
 
+    _parseSleepWindows(rawWindows) {
+        if (!rawWindows || typeof rawWindows !== "string") {
+            return [];
+        }
+
+        return rawWindows
+            .split(",")
+            .map(item => item.trim())
+            .filter(Boolean)
+            .map(item => {
+                const match = item.match(/^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/);
+                if (!match) {
+                    this.logger.warn(`[Config] Ignoring invalid sleep window "${item}". Expected HH:mm-HH:mm.`);
+                    return null;
+                }
+
+                const [, startHourRaw, startMinuteRaw, endHourRaw, endMinuteRaw] = match;
+                const startHour = parseInt(startHourRaw, 10);
+                const startMinute = parseInt(startMinuteRaw, 10);
+                const endHour = parseInt(endHourRaw, 10);
+                const endMinute = parseInt(endMinuteRaw, 10);
+
+                if (
+                    startHour > 23 ||
+                    startMinute > 59 ||
+                    endHour > 23 ||
+                    endMinute > 59 ||
+                    (startHour === endHour && startMinute === endMinute)
+                ) {
+                    this.logger.warn(`[Config] Ignoring invalid sleep window "${item}".`);
+                    return null;
+                }
+
+                return {
+                    endMinutes: endHour * 60 + endMinute,
+                    raw: item,
+                    startMinutes: startHour * 60 + startMinute,
+                };
+            })
+            .filter(Boolean);
+    }
+
     loadConfiguration() {
         const config = {
             apiKeys: [],
             apiKeySource: "Not set",
+            autoSleepEnabled: false,
             browserExecutablePath: null,
             enableAuthUpdate: true,
             enableUsageStats: true,
@@ -31,12 +74,16 @@ class ConfigLoader {
             forceWebSearch: false,
             host: "0.0.0.0",
             httpPort: 7860,
+            idleSleepMinutes: 30,
             immediateSwitchStatusCodes: [429, 503],
             maxContexts: 1,
             maxRetries: 3,
+            quotaCooldownMinutes: 60,
             retryDelay: 2000,
+            sleepWindows: [],
             streamingMode: "real",
             switchOnUses: 40,
+            timezone: process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone,
             wsPort: 9998,
         };
 
@@ -79,14 +126,28 @@ class ConfigLoader {
         if (process.env.API_KEYS) {
             config.apiKeys = process.env.API_KEYS.split(",");
         }
+        if (process.env.AUTO_SLEEP_ENABLED) {
+            config.autoSleepEnabled = process.env.AUTO_SLEEP_ENABLED.toLowerCase() === "true";
+        }
         if (process.env.FORCE_THINKING) config.forceThinking = process.env.FORCE_THINKING.toLowerCase() === "true";
         if (process.env.FORCE_WEB_SEARCH) config.forceWebSearch = process.env.FORCE_WEB_SEARCH.toLowerCase() === "true";
         if (process.env.FORCE_URL_CONTEXT)
             config.forceUrlContext = process.env.FORCE_URL_CONTEXT.toLowerCase() === "true";
+        if (process.env.IDLE_SLEEP_MINUTES) {
+            const parsed = parseInt(process.env.IDLE_SLEEP_MINUTES, 10);
+            config.idleSleepMinutes = Number.isFinite(parsed) ? Math.max(0, parsed) : config.idleSleepMinutes;
+        }
         if (process.env.ENABLE_AUTH_UPDATE)
             config.enableAuthUpdate = process.env.ENABLE_AUTH_UPDATE.toLowerCase() !== "false";
         if (process.env.ENABLE_USAGE_STATS)
             config.enableUsageStats = process.env.ENABLE_USAGE_STATS.toLowerCase() !== "false";
+        if (process.env.QUOTA_COOLDOWN_MINUTES) {
+            const parsed = parseInt(process.env.QUOTA_COOLDOWN_MINUTES, 10);
+            config.quotaCooldownMinutes = Number.isFinite(parsed) ? Math.max(1, parsed) : config.quotaCooldownMinutes;
+        }
+        if (process.env.SLEEP_WINDOWS) {
+            config.sleepWindows = this._parseSleepWindows(process.env.SLEEP_WINDOWS);
+        }
 
         let rawCodes = process.env.IMMEDIATE_SWITCH_STATUS_CODES;
         let codesSource = "environment variable";
@@ -164,6 +225,8 @@ class ConfigLoader {
         this.logger.info(`  Force Web Search: ${config.forceWebSearch}`);
         this.logger.info(`  Force URL Context: ${config.forceUrlContext}`);
         this.logger.info(`  Auto Update Auth: ${config.enableAuthUpdate}`);
+        this.logger.info(`  Auto Sleep Enabled: ${config.autoSleepEnabled}`);
+        this.logger.info(`  Idle Sleep Minutes: ${config.idleSleepMinutes}`);
         this.logger.info(`  Usage Stats: ${config.enableUsageStats}`);
         this.logger.info(`  Max Contexts: ${config.maxContexts === 0 ? "Unlimited" : config.maxContexts}`);
         this.logger.info(
@@ -182,7 +245,14 @@ class ConfigLoader {
             }`
         );
         this.logger.info(`  Max Retries per Request: ${config.maxRetries} times`);
+        this.logger.info(`  Quota Cooldown Minutes: ${config.quotaCooldownMinutes}`);
         this.logger.info(`  Retry Delay: ${config.retryDelay}ms`);
+        this.logger.info(
+            `  Scheduled Sleep Windows: ${
+                config.sleepWindows.length > 0 ? config.sleepWindows.map(window => window.raw).join(", ") : "Disabled"
+            }`
+        );
+        this.logger.info(`  Timezone: ${config.timezone}`);
         this.logger.info(`  API Key Source: ${config.apiKeySource}`);
 
         const proxySummary = getProxySummaryFromEnv();

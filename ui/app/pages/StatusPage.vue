@@ -276,8 +276,54 @@
                                 </span>
                                 <span class="value account-value">
                                     <span class="account-name" :class="currentAccountNameClass">
-                                        #{{ state.currentAuthIndex }} {{ currentAccountName }}
+                                        {{ currentAccountLabel }}
                                     </span>
+                                </span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">
+                                    <svg
+                                        xmlns="http://www.w3.org/2000/svg"
+                                        width="14"
+                                        height="14"
+                                        viewBox="0 0 24 24"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        stroke-width="2"
+                                        stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                        style="margin-right: 6px"
+                                    >
+                                        <path d="M12 6v6l4 2"></path>
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                    </svg>
+                                    {{ t("sleeping") }}
+                                </span>
+                                <span class="value status-text-bold" :class="sleepStatusClass">
+                                    {{ sleepStatusText }}
+                                </span>
+                            </div>
+                            <div v-if="state.sleepState.isSleeping" class="status-item">
+                                <span class="label">
+                                    <svg
+                                        xmlns="http://www.w3.org/2000/svg"
+                                        width="14"
+                                        height="14"
+                                        viewBox="0 0 24 24"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        stroke-width="2"
+                                        stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                        style="margin-right: 6px"
+                                    >
+                                        <path d="M12 8v4l3 3"></path>
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                    </svg>
+                                    {{ t("nextWakeAt") }}
+                                </span>
+                                <span class="value">
+                                    {{ formatDateTime(state.sleepState.nextWakeAt) }}
                                 </span>
                             </div>
                             <div class="status-item">
@@ -786,7 +832,7 @@
                                     @click.stop
                                 />
                                 <el-tooltip
-                                    :content="getAccountDisplayName(item)"
+                                    :content="getAccountTooltipContent(item)"
                                     placement="top"
                                     effect="dark"
                                     :hide-after="0"
@@ -804,6 +850,9 @@
                                         </span>
                                         <span v-if="item.isExpired" class="expired-badge">
                                             {{ t("tagExpired") }}
+                                        </span>
+                                        <span v-if="item.isCoolingDown" class="cooldown-badge">
+                                            {{ t("tagCoolingDown") }}
                                         </span>
                                     </div>
                                 </el-tooltip>
@@ -897,6 +946,61 @@
                             </div>
                             <div v-if="state.accountDetails.length === 0" class="account-list-empty">
                                 {{ t("noActiveAccount") }}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="status-card">
+                        <h3 class="card-title">
+                            <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                width="18"
+                                height="18"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                style="margin-right: 8px; vertical-align: text-bottom"
+                            >
+                                <path d="M12 6v6l4 2"></path>
+                                <circle cx="12" cy="12" r="10"></circle>
+                            </svg>
+                            {{ t("sleepCooldown") }}
+                        </h3>
+                        <div class="status-list">
+                            <div class="status-item">
+                                <span class="label">{{ t("sleeping") }}</span>
+                                <span class="value status-text-bold" :class="sleepStatusClass">{{
+                                    sleepStatusText
+                                }}</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("nextWakeAt") }}</span>
+                                <span class="value">{{ formatDateTime(state.sleepState.nextWakeAt) }}</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("cooldownUntil") }}</span>
+                                <span class="value">
+                                    {{
+                                        state.cooldownSummary.earliestAvailableAt
+                                            ? formatDateTime(state.cooldownSummary.earliestAvailableAt)
+                                            : "-"
+                                    }}
+                                </span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("idleSleep") }}</span>
+                                <span class="value">{{ state.sleepState.idleSleepMinutes || 0 }} min</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("scheduleWindows") }}</span>
+                                <span class="value">{{ sleepWindowsText }}</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("timezoneLabel") }}</span>
+                                <span class="value">{{ state.sleepState.timezone || "-" }}</span>
                             </div>
                         </div>
                     </div>
@@ -2504,6 +2608,7 @@
                     </button>
                 </header>
                 <div class="status-card logs-card">
+                    <!-- eslint-disable-next-line vue/no-v-html -->
                     <pre id="log-container" v-html="formattedLogs"></pre>
                 </div>
             </div>
@@ -3201,6 +3306,20 @@ const formatDateTime = value => {
     return date.toLocaleString();
 };
 
+const formatRemainingDuration = value => {
+    const ms = Number(value);
+    if (!Number.isFinite(ms) || ms <= 0) return "0 min";
+
+    const totalMinutes = Math.ceil(ms / 60000);
+    if (totalMinutes < 60) {
+        return `${totalMinutes} min`;
+    }
+
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+};
+
 const formatDuration = value => {
     const duration = Number(value);
     if (!Number.isFinite(duration)) return "-";
@@ -3465,6 +3584,10 @@ const state = reactive({
     activeContextsCount: 0,
     apiKeySource: "",
     browserConnected: false,
+    cooldownSummary: {
+        cooledDownIndicesRaw: [],
+        earliestAvailableAt: null,
+    },
     currentAuthIndex: -1,
     currentLang: I18n.getLang(),
     debugModeEnabled: false,
@@ -3487,6 +3610,17 @@ const state = reactive({
     releaseUrl: null,
     selectedAccounts: new Set(), // Selected account indices
     serviceConnected: false,
+    sleepState: {
+        idleSleepMinutes: 0,
+        isSleeping: false,
+        lastActivityAt: null,
+        nextWakeAt: null,
+        pendingScheduleSleep: false,
+        preferredWakeAuthIndex: null,
+        sleepReason: null,
+        sleepWindows: [],
+        timezone: null,
+    },
     streamingModeReal: false,
     // theme: handled by useTheme
     usageCount: 0,
@@ -3496,6 +3630,9 @@ const browserConnectedClass = computed(() => {
     if (state.isSystemBusy) {
         return "status-warning";
     }
+    if (state.sleepState.isSleeping) {
+        return "status-warning";
+    }
     return state.browserConnected ? "status-ok" : "status-error";
 });
 
@@ -3503,7 +3640,33 @@ const browserConnectedText = computed(() => {
     if (state.isSystemBusy) {
         return t("connecting");
     }
+    if (state.sleepState.isSleeping) {
+        return sleepStatusText.value;
+    }
     return state.browserConnected ? t("running") : t("disconnected");
+});
+
+const sleepStatusClass = computed(() => (state.sleepState.isSleeping ? "status-warning" : "status-ok"));
+
+const sleepStatusText = computed(() => {
+    if (!state.sleepState.isSleeping) {
+        return t("running");
+    }
+
+    if (state.sleepState.sleepReason === "schedule") {
+        return t("sleepReasonSchedule");
+    }
+
+    if (state.sleepState.sleepReason === "idle") {
+        return t("sleepReasonIdle");
+    }
+
+    return t("sleeping");
+});
+
+const sleepWindowsText = computed(() => {
+    const windows = state.sleepState.sleepWindows || [];
+    return windows.length > 0 ? windows.join(", ") : "-";
 });
 
 // Total scanned accounts count
@@ -3756,6 +3919,13 @@ const currentAccountName = computed(() => {
     return account ? getAccountDisplayName(account) : t("noActiveAccount");
 });
 
+const currentAccountLabel = computed(() => {
+    if (state.currentAuthIndex < 0) {
+        return currentAccountName.value;
+    }
+    return `#${state.currentAuthIndex} ${currentAccountName.value}`;
+});
+
 const currentAccountNameClass = computed(() => {
     if (state.currentAuthIndex < 0) {
         return "status-error";
@@ -3807,6 +3977,15 @@ const getAccountDisplayName = account => {
         return `${name} (${t("duplicateAuthHint", { index: account.canonicalIndex })})`;
     }
     return name;
+};
+
+const getAccountTooltipContent = account => {
+    const baseName = getAccountDisplayName(account);
+    if (!account.isCoolingDown) {
+        return baseName;
+    }
+
+    return `${baseName} | ${t("cooldownUntil")}: ${formatDateTime(account.cooldownUntil)} | ${t("cooldownRemaining")}: ${formatRemainingDuration(account.cooldownRemainingMs)}`;
 };
 
 const addUser = () => {
@@ -4168,12 +4347,27 @@ const updateStatus = data => {
     }
     state.browserConnected = data.status.browserConnected;
     state.apiKeySource = data.status.apiKeySource;
+    state.cooldownSummary = data.status.cooldownSummary || {
+        cooledDownIndicesRaw: [],
+        earliestAvailableAt: null,
+    };
     state.usageCount = data.status.usageCount;
     state.failureCount = data.status.failureCount;
     state.logCount = data.logCount || 0;
     state.logMaxCount = data.status.logMaxCount || 100;
     state.logs = data.logs || "";
     state.isSystemBusy = data.status.isSystemBusy;
+    state.sleepState = data.status.sleepState || {
+        idleSleepMinutes: 0,
+        isSleeping: false,
+        lastActivityAt: null,
+        nextWakeAt: null,
+        pendingScheduleSleep: false,
+        preferredWakeAuthIndex: null,
+        sleepReason: null,
+        sleepWindows: [],
+        timezone: null,
+    };
 
     nextTick(() => {
         state.isUpdating = false;
@@ -5105,6 +5299,17 @@ watchEffect(() => {
     font-size: 0.75rem;
     padding: 2px 8px;
     background: @error-color;
+    color: @text-on-primary;
+    border-radius: 12px;
+    flex-shrink: 0;
+    margin-left: 0;
+    margin-right: 6px;
+}
+
+.cooldown-badge {
+    font-size: 0.75rem;
+    padding: 2px 8px;
+    background: @warning-color;
     color: @text-on-primary;
     border-radius: 12px;
     flex-shrink: 0;

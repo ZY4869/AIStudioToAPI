@@ -25,6 +25,10 @@ class StatusRoutes {
         this.versionChecker = new VersionChecker(this.logger);
     }
 
+    _recordInteractiveActivity() {
+        this.serverSystem.sleepManager?.recordActivity();
+    }
+
     _rejectIfSystemBusy(res) {
         if (!this.serverSystem.requestHandler?.isSystemBusy) {
             return false;
@@ -177,6 +181,7 @@ class StatusRoutes {
         app.put("/api/accounts/current", isAuthenticated, async (req, res) => {
             try {
                 if (this._rejectIfSystemBusy(res)) return;
+                this._recordInteractiveActivity();
 
                 const { targetIndex } = req.body;
                 if (targetIndex !== undefined && targetIndex !== null) {
@@ -209,6 +214,7 @@ class StatusRoutes {
         app.post("/api/accounts/deduplicate", isAuthenticated, async (req, res) => {
             try {
                 if (this._rejectIfSystemBusy(res)) return;
+                this._recordInteractiveActivity();
 
                 const { authSource, requestHandler } = this.serverSystem;
 
@@ -319,6 +325,7 @@ class StatusRoutes {
         // Batch delete accounts - Must be defined before /api/accounts/:index to avoid index matching "batch"
         app.delete("/api/accounts/batch", isAuthenticated, async (req, res) => {
             if (this._rejectIfSystemBusy(res)) return;
+            this._recordInteractiveActivity();
 
             const { indices, force } = req.body;
             const currentAuthIndex = this.serverSystem.requestHandler.currentAuthIndex;
@@ -542,6 +549,7 @@ class StatusRoutes {
 
         app.delete("/api/accounts/:index", isAuthenticated, async (req, res) => {
             if (this._rejectIfSystemBusy(res)) return;
+            this._recordInteractiveActivity();
 
             const rawIndex = req.params.index;
             const targetIndex = Number(rawIndex);
@@ -697,6 +705,7 @@ class StatusRoutes {
 
         app.post("/api/files", isAuthenticated, async (req, res) => {
             if (this._rejectIfSystemBusy(res)) return;
+            this._recordInteractiveActivity();
 
             const { content } = req.body;
             // Ignore req.body.filename - auto rename
@@ -846,10 +855,11 @@ class StatusRoutes {
     }
 
     _getStatusData() {
-        const { config, requestHandler, authSource, browserManager } = this.serverSystem;
+        const { config, requestHandler, authSource, browserManager, sleepManager } = this.serverSystem;
         const initialIndices = authSource.initialIndices || [];
         const invalidIndices = initialIndices.filter(i => !authSource.availableIndices.includes(i));
         const rotationIndices = authSource.getRotationIndices();
+        const cooldownIndices = authSource.getCooldownIndices();
         const duplicateIndices = authSource.duplicateIndices || [];
         const expiredIndices = authSource.expiredIndices || [];
         const limit = this.logger.displayLimit || 100;
@@ -861,13 +871,30 @@ class StatusRoutes {
             const name = isInvalid ? null : accountNameMap.get(index) || null;
 
             const canonicalIndex = isInvalid ? null : authSource.getCanonicalIndex(index);
+            const cooldownInfo = authSource.getCooldownInfo(index);
+            const isCoolingDown = cooldownIndices.includes(index);
             const isDuplicate = canonicalIndex !== null && canonicalIndex !== index;
             const isRotation = rotationIndices.includes(index);
             const isExpired = expiredIndices.includes(index);
 
             const hasContext = browserManager.contexts.has(index);
 
-            return { canonicalIndex, hasContext, index, isDuplicate, isExpired, isInvalid, isRotation, name };
+            return {
+                canonicalIndex,
+                cooldownReason: cooldownInfo?.cooldownReason || null,
+                cooldownRemainingMs: cooldownInfo?.cooldownUntil
+                    ? Math.max(0, new Date(cooldownInfo.cooldownUntil).getTime() - Date.now())
+                    : 0,
+                cooldownUntil: cooldownInfo?.cooldownUntil || null,
+                hasContext,
+                index,
+                isCoolingDown,
+                isDuplicate,
+                isExpired,
+                isInvalid,
+                isRotation,
+                name,
+            };
         });
 
         const currentAuthIndex = requestHandler.currentAuthIndex;
@@ -891,6 +918,10 @@ class StatusRoutes {
                 activeContextsCount: browserManager.contexts.size,
                 apiKeySource: config.apiKeySource,
                 browserConnected: !!this.serverSystem.connectionRegistry.getConnectionByAuth(currentAuthIndex, false),
+                cooldownSummary: {
+                    cooledDownIndicesRaw: cooldownIndices,
+                    earliestAvailableAt: authSource.getEarliestCooldownExpiry(),
+                },
                 currentAccountName,
                 currentAuthIndex,
                 debugMode: LoggingService.isDebugEnabled(),
@@ -911,6 +942,7 @@ class StatusRoutes {
                 maxContexts: config.maxContexts,
                 maxRetries: config.maxRetries,
                 rotationIndicesRaw: rotationIndices,
+                sleepState: sleepManager ? sleepManager.getStatus() : null,
                 streamingMode: this.serverSystem.streamingMode,
                 usageCount,
             },
