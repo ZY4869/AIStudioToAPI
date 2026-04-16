@@ -9,6 +9,7 @@ const fs = require("fs");
 const path = require("path");
 const net = require("net");
 const { spawn } = require("child_process");
+const { DEFAULT_ACCOUNT_TIER } = require("../utils/AccountTierUtils");
 
 /**
  * CreateAuth Manager
@@ -493,7 +494,7 @@ class CreateAuth {
 
         try {
             const storageState = await context.storageState();
-            const authData = { ...storageState, accountName };
+            const authData = { ...storageState, accountName, accountTier: DEFAULT_ACCOUNT_TIER };
 
             const configDir = path.join(process.cwd(), "configs", "auth");
             if (!fs.existsSync(configDir)) {

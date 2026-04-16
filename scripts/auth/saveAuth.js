@@ -34,6 +34,7 @@ const VALIDATION_LINE_THRESHOLD = 200; // Validation line threshold
 const CONFIG_DIR = "configs/auth"; // Authentication files directory
 
 const { parseProxyFromEnv } = require("../../src/utils/ProxyUtils");
+const { DEFAULT_ACCOUNT_TIER } = require("../../src/utils/AccountTierUtils");
 
 /**
  * Ensures that the specified directory exists, creating it if it doesn't.
@@ -364,6 +365,7 @@ const getNextAuthIndex = () => {
     console.log(getText("正在获取并验证登录状态...", "Retrieving and validating login status..."));
     const currentState = await context.storageState();
     currentState.accountName = accountName;
+    currentState.accountTier = DEFAULT_ACCOUNT_TIER;
     const prettyStateString = JSON.stringify(currentState, null, 2);
     const lineCount = prettyStateString.split("\n").length;
 

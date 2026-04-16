@@ -20,10 +20,12 @@ const AuthSource = require("../auth/AuthSource");
 const BrowserManager = require("./BrowserManager");
 const ConnectionRegistry = require("./ConnectionRegistry");
 const RequestHandler = require("./RequestHandler");
+const RuntimeSettingsManager = require("./RuntimeSettingsManager");
 const SleepManager = require("./SleepManager");
 const UsageStatsService = require("./UsageStatsService");
 const ConfigLoader = require("../utils/ConfigLoader");
 const WebRoutes = require("../routes/WebRoutes");
+const { DEFAULT_ACCOUNT_TIER, normalizeAccountTier } = require("../utils/AccountTierUtils");
 
 /**
  * Proxy Server System
@@ -113,11 +115,25 @@ class ProxyServerSystem extends EventEmitter {
             this.authSource
         );
         this.sleepManager = new SleepManager(this.logger, this.config, this.browserManager, this.authSource);
+        this.runtimeSettingsManager = new RuntimeSettingsManager(this.logger, this.config, this.sleepManager);
         this.sleepManager.setRequestHandler(this.requestHandler);
 
         this.httpServer = null;
         this.wsServer = null;
         this.webRoutes = new WebRoutes(this);
+    }
+
+    getExposedModelList() {
+        this.authSource.reloadAuthSources();
+
+        return this.config.modelList.filter(model => {
+            const requiredTier = normalizeAccountTier(model?.minAccountTier);
+            if (requiredTier === DEFAULT_ACCOUNT_TIER) {
+                return true;
+            }
+
+            return this.authSource.hasEligibleRotationAccount(requiredTier);
+        });
     }
 
     async start(initialAuthIndex = null) {
@@ -478,8 +494,9 @@ class ProxyServerSystem extends EventEmitter {
 
         // API routes
         app.get(["/v1/models"], (req, res) => {
+            const exposedModels = this.getExposedModelList();
             // OpenAI format
-            const models = this.config.modelList.map(model => ({
+            const models = exposedModels.map(model => ({
                 context_window: model.inputTokenLimit,
                 created: Math.floor(Date.now() / 1000),
                 id: model.name.replace("models/", ""),
@@ -495,7 +512,7 @@ class ProxyServerSystem extends EventEmitter {
         });
 
         app.get(["/v1beta/models"], (req, res) => {
-            res.status(200).json({ models: this.config.modelList });
+            res.status(200).json({ models: this.getExposedModelList() });
         });
 
         app.post("/v1/chat/completions", (req, res) => {

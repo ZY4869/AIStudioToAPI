@@ -75,7 +75,13 @@ class SleepManager {
     }
 
     getStatus() {
+        const idleSleepDeadlineAt = this._getIdleSleepDeadlineAt();
+
         return {
+            activeRequestCount: this.activeRequestCount,
+            autoSleepEnabled: this.config.autoSleepEnabled === true,
+            idleCountdownRemainingMs: this._getIdleCountdownRemainingMs(idleSleepDeadlineAt),
+            idleSleepDeadlineAt,
             idleSleepMinutes: this.config.idleSleepMinutes,
             isSleeping: this.isSleeping,
             lastActivityAt: this.lastActivityAt,
@@ -84,6 +90,7 @@ class SleepManager {
             preferredWakeAuthIndex: this.preferredWakeAuthIndex,
             sleepReason: this.sleepReason,
             sleepWindows: (this.config.sleepWindows || []).map(window => window.raw),
+            sleepWindowsRaw: this.config.sleepWindowsRaw || "",
             timezone: this.config.timezone,
         };
     }
@@ -191,6 +198,17 @@ class SleepManager {
         ) {
             await this.enterSleep("idle", "idle_timeout");
         }
+    }
+
+    async handleSettingsUpdated(trigger = "settings_updated") {
+        this.logger.info(`[Sleep] Re-evaluating sleep state after settings update (${trigger}).`);
+
+        if (this.isSleeping && this.sleepReason === "idle" && !this.config.autoSleepEnabled) {
+            await this.wakeUp("auto_sleep_disabled");
+            return;
+        }
+
+        await this.runHeartbeat();
     }
 
     async enterSleep(reason, trigger = "system") {
@@ -324,6 +342,32 @@ class SleepManager {
         const lastActivity = new Date(this.lastActivityAt);
         if (Number.isNaN(lastActivity.getTime())) return false;
         return Date.now() - lastActivity.getTime() >= this.config.idleSleepMinutes * 60 * 1000;
+    }
+
+    _getIdleSleepDeadlineAt() {
+        if (!this.config.autoSleepEnabled || this.config.idleSleepMinutes <= 0) {
+            return null;
+        }
+
+        const lastActivity = new Date(this.lastActivityAt);
+        if (Number.isNaN(lastActivity.getTime())) {
+            return null;
+        }
+
+        return new Date(lastActivity.getTime() + this.config.idleSleepMinutes * 60 * 1000).toISOString();
+    }
+
+    _getIdleCountdownRemainingMs(idleSleepDeadlineAt) {
+        if (!idleSleepDeadlineAt || this.isSleeping || this.activeRequestCount > 0 || this.isInScheduledSleepWindow()) {
+            return null;
+        }
+
+        const deadlineAt = new Date(idleSleepDeadlineAt);
+        if (Number.isNaN(deadlineAt.getTime())) {
+            return null;
+        }
+
+        return Math.max(0, deadlineAt.getTime() - Date.now());
     }
 
     _isWakeCandidate(index) {

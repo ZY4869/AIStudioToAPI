@@ -8,6 +8,13 @@
 const fs = require("fs");
 const fsPromises = require("fs").promises;
 const path = require("path");
+const {
+    DEFAULT_ACCOUNT_TIER,
+    isValidAccountTier,
+    normalizeAccountTier,
+    normalizeAuthDataAccountTier,
+    satisfiesMinAccountTier,
+} = require("../utils/AccountTierUtils");
 
 /**
  * Authentication Source Management Module
@@ -27,6 +34,7 @@ class AuthSource {
         this.cooldownInfoMap = new Map();
         this.initialIndices = [];
         this.accountNameMap = new Map();
+        this.accountTierMap = new Map();
         // Map any valid index -> canonical (latest) index for the same account email
         this.canonicalIndexMap = new Map();
         // Duplicate groups (email -> kept + duplicates)
@@ -115,6 +123,7 @@ class AuthSource {
             this.expiredIndices = [];
             this.cooldownInfoMap.clear();
             this.accountNameMap.clear();
+            this.accountTierMap.clear();
             this.canonicalIndexMap.clear();
             this.duplicateGroups = [];
             return;
@@ -123,6 +132,7 @@ class AuthSource {
         const validIndices = [];
         const invalidSourceDescriptions = [];
         this.accountNameMap.clear(); // Clear old names before re-validating
+        this.accountTierMap.clear();
         this.canonicalIndexMap.clear();
         this.cooldownInfoMap.clear();
         this.duplicateGroups = [];
@@ -133,9 +143,10 @@ class AuthSource {
             const authContent = this._getAuthContent(index);
             if (authContent) {
                 try {
-                    const authData = JSON.parse(authContent);
+                    const authData = normalizeAuthDataAccountTier(JSON.parse(authContent));
                     validIndices.push(index);
                     this.accountNameMap.set(index, authData.accountName || null);
+                    this.accountTierMap.set(index, authData.accountTier);
                     // Track expired status from auth file
                     if (authData.expired === true) {
                         this.expiredIndices.push(index);
@@ -283,7 +294,7 @@ class AuthSource {
         }
 
         try {
-            return JSON.parse(jsonString);
+            return normalizeAuthDataAccountTier(JSON.parse(jsonString));
         } catch (e) {
             this.logger.error(`[Auth] Failed to parse JSON content from authentication source #${index}: ${e.message}`);
             return null;
@@ -293,6 +304,23 @@ class AuthSource {
     getRotationIndices() {
         this.cleanupExpiredCooldowns();
         return this.rotationIndices;
+    }
+
+    getAccountTier(index) {
+        if (!Number.isInteger(index)) {
+            return DEFAULT_ACCOUNT_TIER;
+        }
+
+        return this.accountTierMap.get(index) || DEFAULT_ACCOUNT_TIER;
+    }
+
+    getEligibleRotationIndices(minTier = DEFAULT_ACCOUNT_TIER) {
+        this.cleanupExpiredCooldowns();
+        return this.rotationIndices.filter(index => satisfiesMinAccountTier(this.getAccountTier(index), minTier));
+    }
+
+    hasEligibleRotationAccount(minTier = DEFAULT_ACCOUNT_TIER) {
+        return this.getEligibleRotationIndices(minTier).length > 0;
     }
 
     getCanonicalIndex(index) {
@@ -347,9 +375,27 @@ class AuthSource {
 
     _updateAuthFileSync(index, updater) {
         const authFilePath = path.join(process.cwd(), "configs", "auth", `auth-${index}.json`);
-        const authData = JSON.parse(fs.readFileSync(authFilePath, "utf-8"));
+        const authData = normalizeAuthDataAccountTier(JSON.parse(fs.readFileSync(authFilePath, "utf-8")));
         updater(authData);
         fs.writeFileSync(authFilePath, JSON.stringify(authData, null, 2));
+    }
+
+    setAccountTier(index, accountTier) {
+        if (!Number.isInteger(index) || !this.availableIndices.includes(index)) {
+            throw new Error(`Auth file for account #${index} does not exist or is not editable.`);
+        }
+
+        if (!isValidAccountTier(accountTier)) {
+            throw new Error("Invalid account tier.");
+        }
+
+        const normalizedTier = normalizeAccountTier(accountTier);
+        this._updateAuthFileSync(index, authData => {
+            authData.accountTier = normalizedTier;
+        });
+        this.accountTierMap.set(index, normalizedTier);
+
+        return normalizedTier;
     }
 
     cleanupExpiredCooldowns() {

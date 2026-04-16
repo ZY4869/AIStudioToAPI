@@ -11,6 +11,7 @@ const archiver = require("archiver");
 const VersionChecker = require("../utils/VersionChecker");
 const LoggingService = require("../utils/LoggingService");
 const UsageStatsService = require("../core/UsageStatsService");
+const { isValidAccountTier, normalizeAuthDataAccountTier } = require("../utils/AccountTierUtils");
 
 /**
  * Status Routes Manager
@@ -38,6 +39,22 @@ class StatusRoutes {
             error: "System is busy switching or recovering accounts. Please try again later.",
             message: "systemBusySwitchingOrRecoveringAccounts",
         });
+    }
+
+    _serializeUploadedAuthContent(content) {
+        const normalizedContent = typeof content === "object" ? normalizeAuthDataAccountTier(content) : content;
+        const fileContent =
+            typeof normalizedContent === "object" ? JSON.stringify(normalizedContent, null, 2) : normalizedContent;
+
+        if (typeof fileContent !== "string") {
+            return fileContent;
+        }
+
+        try {
+            return JSON.stringify(normalizeAuthDataAccountTier(JSON.parse(fileContent)), null, 2);
+        } catch {
+            return fileContent;
+        }
     }
 
     /**
@@ -208,6 +225,45 @@ class StatusRoutes {
                 }
             } catch (error) {
                 res.status(500).json({ error: error.message, message: "accountSwitchFatal" });
+            }
+        });
+
+        app.put("/api/accounts/:index/tier", isAuthenticated, async (req, res) => {
+            try {
+                if (this._rejectIfSystemBusy(res)) return;
+                this._recordInteractiveActivity();
+
+                const targetIndex = Number(req.params.index);
+                const { accountTier } = req.body || {};
+                const { authSource } = this.serverSystem;
+
+                if (!Number.isInteger(targetIndex)) {
+                    return res.status(400).json({ message: "errorInvalidIndex" });
+                }
+
+                if (!authSource.initialIndices.includes(targetIndex)) {
+                    return res.status(404).json({ index: targetIndex, message: "errorAccountNotFound" });
+                }
+
+                if (!isValidAccountTier(accountTier)) {
+                    return res.status(400).json({ message: "errorInvalidAccountTier" });
+                }
+
+                if (!authSource.availableIndices.includes(targetIndex)) {
+                    return res.status(404).json({ index: targetIndex, message: "errorAccountTierNotEditable" });
+                }
+
+                const normalizedTier = authSource.setAccountTier(targetIndex, accountTier);
+                this.logger.info(`[WebUI] Updated account tier for auth #${targetIndex}: ${normalizedTier}`);
+
+                return res.status(200).json({
+                    accountTier: normalizedTier,
+                    index: targetIndex,
+                    message: "accountTierUpdateSuccess",
+                });
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to update account tier: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "accountTierUpdateFailed" });
             }
         });
 
@@ -703,6 +759,23 @@ class StatusRoutes {
             }
         });
 
+        app.put("/api/settings/sleep-cooldown", isAuthenticated, async (req, res) => {
+            this._recordInteractiveActivity();
+
+            try {
+                const settings = await this.serverSystem.runtimeSettingsManager.updateSleepCooldownSettings(
+                    req.body || {}
+                );
+                res.status(200).json({
+                    message: "sleepCooldownSettingsSaved",
+                    settings,
+                });
+            } catch (error) {
+                this.logger.warn(`[WebUI] Failed to update sleep/cooldown settings: ${error.message}`);
+                res.status(400).json({ error: error.message, message: "settingFailed" });
+            }
+        });
+
         app.post("/api/files", isAuthenticated, async (req, res) => {
             if (this._rejectIfSystemBusy(res)) return;
             this._recordInteractiveActivity();
@@ -727,7 +800,7 @@ class StatusRoutes {
                 }
 
                 // If content is object, stringify it
-                const fileContent = typeof content === "object" ? JSON.stringify(content, null, 2) : content;
+                const fileContent = this._serializeUploadedAuthContent(content);
 
                 // Always use max index + 1 to ensure new auth is always the latest
                 // This simplifies dedup logic assumption: higher index = newer auth
@@ -794,7 +867,7 @@ class StatusRoutes {
 
                     try {
                         // If content is object, stringify it
-                        const fileContent = typeof content === "object" ? JSON.stringify(content, null, 2) : content;
+                        const fileContent = this._serializeUploadedAuthContent(content);
 
                         const newFilename = `auth-${nextAuthIndex}.json`;
                         const filePath = path.join(configDir, newFilename);
@@ -876,10 +949,12 @@ class StatusRoutes {
             const isDuplicate = canonicalIndex !== null && canonicalIndex !== index;
             const isRotation = rotationIndices.includes(index);
             const isExpired = expiredIndices.includes(index);
+            const accountTier = isInvalid ? null : authSource.getAccountTier(index);
 
             const hasContext = browserManager.contexts.has(index);
 
             return {
+                accountTier,
                 canonicalIndex,
                 cooldownReason: cooldownInfo?.cooldownReason || null,
                 cooldownRemainingMs: cooldownInfo?.cooldownUntil
@@ -942,6 +1017,7 @@ class StatusRoutes {
                 maxContexts: config.maxContexts,
                 maxRetries: config.maxRetries,
                 rotationIndicesRaw: rotationIndices,
+                sleepCooldownSettings: this.serverSystem.runtimeSettingsManager.getSleepCooldownSettings(),
                 sleepState: sleepManager ? sleepManager.getStatus() : null,
                 streamingMode: this.serverSystem.streamingMode,
                 usageCount,

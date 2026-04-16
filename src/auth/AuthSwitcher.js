@@ -30,8 +30,19 @@ class AuthSwitcher {
         this.browserManager.currentAuthIndex = value;
     }
 
-    async switchToNextAuth() {
-        const available = this.authSource.getRotationIndices();
+    _resolveAvailableRotationIndices(allowedIndices = null) {
+        const rotationIndices = this.authSource.getRotationIndices();
+        if (!Array.isArray(allowedIndices)) {
+            return rotationIndices;
+        }
+
+        const allowedSet = new Set(allowedIndices.filter(Number.isInteger));
+        return rotationIndices.filter(index => allowedSet.has(index));
+    }
+
+    async switchToNextAuth(options = {}) {
+        const { allowedIndices = null } = options;
+        const available = this._resolveAvailableRotationIndices(allowedIndices);
 
         if (available.length === 0) {
             throw new Error("No available authentication sources, cannot switch.");
@@ -174,7 +185,8 @@ class AuthSwitcher {
         }
     }
 
-    async switchToSpecificAuth(targetIndex) {
+    async switchToSpecificAuth(targetIndex, options = {}) {
+        const { allowedIndices = null } = options;
         if (this.isSystemBusy) {
             this.logger.info("[Auth] Account switching in progress, skipping duplicate operation");
             return { reason: "Switch already in progress.", success: false };
@@ -183,6 +195,16 @@ class AuthSwitcher {
         if (!this.authSource.availableIndices.includes(targetIndex)) {
             return {
                 reason: `Switch failed: Account #${targetIndex} invalid or does not exist.`,
+                success: false,
+            };
+        }
+
+        if (
+            Array.isArray(allowedIndices) &&
+            !this._resolveAvailableRotationIndices(allowedIndices).includes(targetIndex)
+        ) {
+            return {
+                reason: `Switch failed: Account #${targetIndex} is not allowed for this request.`,
                 success: false,
             };
         }
@@ -206,10 +228,10 @@ class AuthSwitcher {
         }
     }
 
-    async handleRequestFailureAndSwitch(errorDetails, sendErrorCallback) {
+    async handleRequestFailureAndSwitch(errorDetails, sendErrorCallback, options = {}) {
         const cooldownDecision = classifyQuotaCooldown(errorDetails, this.config.quotaCooldownMinutes);
         if (cooldownDecision.isCooldown) {
-            return this._handleQuotaCooldown(cooldownDecision, sendErrorCallback);
+            return this._handleQuotaCooldown(cooldownDecision, sendErrorCallback, options);
         }
 
         this.failureCount++;
@@ -239,7 +261,7 @@ class AuthSwitcher {
             }
 
             try {
-                const result = await this.switchToNextAuth();
+                const result = await this.switchToNextAuth(options);
                 if (!result.success) {
                     this.logger.warn(`[Auth] Account switch skipped: ${result.reason}`);
                     if (sendErrorCallback) {
@@ -274,7 +296,7 @@ class AuthSwitcher {
         return { success: false };
     }
 
-    async _handleQuotaCooldown(cooldownDecision, sendErrorCallback) {
+    async _handleQuotaCooldown(cooldownDecision, sendErrorCallback, options = {}) {
         const currentIndex = this.currentAuthIndex;
         if (!Number.isInteger(currentIndex) || currentIndex < 0) {
             this.logger.warn("[Auth] Quota cooldown detected but there is no active account to cool down.");
@@ -298,7 +320,7 @@ class AuthSwitcher {
             this.logger.error(`[Auth] Background rebalance failed after cooldown: ${error.message}`);
         });
 
-        const remainingAccounts = this.authSource.getRotationIndices();
+        const remainingAccounts = this._resolveAvailableRotationIndices(options.allowedIndices);
         if (remainingAccounts.length === 0) {
             const message = `All available accounts are cooling down until ${cooldownDecision.cooldownUntil}.`;
             this.logger.warn(`[Auth] ${message}`);
@@ -311,7 +333,7 @@ class AuthSwitcher {
         }
 
         try {
-            const result = await this.switchToNextAuth();
+            const result = await this.switchToNextAuth(options);
             if (result.success) {
                 const successMessage = `Account #${currentIndex} cooled down. Switched to account #${result.newIndex}.`;
                 this.logger.info(`[Auth] ${successMessage}`);

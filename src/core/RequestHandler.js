@@ -13,6 +13,7 @@ const AuthSwitcher = require("../auth/AuthSwitcher");
 const FormatConverter = require("./FormatConverter");
 const { isUserAbortedError } = require("../utils/CustomErrors");
 const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue");
+const { DEFAULT_ACCOUNT_TIER, getModelMinAccountTier } = require("../utils/AccountTierUtils");
 
 // Timeout constants (in milliseconds)
 const TIMEOUTS = {
@@ -35,7 +36,7 @@ class RequestHandler {
 
         this.maxRetries = this.config.maxRetries;
         this.retryDelay = this.config.retryDelay;
-        this.needsSwitchingAfterRequest = false;
+        this.needsSwitchingAfterRequest = null;
 
         // Timeout settings
         this.timeouts = TIMEOUTS;
@@ -224,6 +225,196 @@ class RequestHandler {
         return match?.[1] || null;
     }
 
+    _refreshRouteContextAllowedIndices(routeContext) {
+        if (!routeContext) {
+            return [];
+        }
+
+        routeContext.allowedIndices = this.authSource.getEligibleRotationIndices(routeContext.requiredTier);
+        return routeContext.allowedIndices;
+    }
+
+    _createRouteContext(modelName) {
+        const cleanModelName =
+            typeof modelName === "string" && modelName.startsWith("models/")
+                ? modelName.replace(/^models\//, "")
+                : modelName;
+        const requiredTier = cleanModelName
+            ? getModelMinAccountTier(this.config.modelList, cleanModelName)
+            : DEFAULT_ACCOUNT_TIER;
+        const routeContext = {
+            allowedIndices: [],
+            cleanModelName: cleanModelName || null,
+            isRestrictedModel: requiredTier !== DEFAULT_ACCOUNT_TIER,
+            requiredTier,
+        };
+
+        this._refreshRouteContextAllowedIndices(routeContext);
+        if (routeContext.cleanModelName) {
+            this.logger.info(
+                `[Route] Model "${routeContext.cleanModelName}" requires tier "${routeContext.requiredTier}". Allowed accounts: [${routeContext.allowedIndices.join(", ")}]`
+            );
+        }
+
+        return routeContext;
+    }
+
+    _getRouteSwitchOptions(routeContext) {
+        if (!routeContext) {
+            return {};
+        }
+
+        return {
+            allowedIndices: [...this._refreshRouteContextAllowedIndices(routeContext)],
+        };
+    }
+
+    _buildInsufficientAccountTierMessage(routeContext) {
+        const modelLabel = routeContext?.cleanModelName || "Requested model";
+        const requiredTierLabel = routeContext?.requiredTier === "pro" ? "pro/ultra" : routeContext?.requiredTier;
+        return `Model "${modelLabel}" requires a ${requiredTierLabel} tier account, but no eligible account is currently available.`;
+    }
+
+    _sendInsufficientAccountTierResponse(res, format, routeContext) {
+        const message = this._buildInsufficientAccountTierMessage(routeContext);
+        this.logger.warn(
+            `[Route] Blocking model "${routeContext?.cleanModelName || "unknown"}" locally: required tier "${routeContext?.requiredTier}", allowed accounts [${routeContext?.allowedIndices?.join(", ") || ""}]`
+        );
+        this._sendApiFormattedErrorResponse(res, format, 403, message, {
+            errorType: "permission_denied",
+            model: routeContext?.cleanModelName || null,
+            reason: "insufficient_account_tier",
+            requiredTier: routeContext?.requiredTier || DEFAULT_ACCOUNT_TIER,
+            statusText: "PERMISSION_DENIED",
+        });
+    }
+
+    async _switchToRouteEligibleAuth(routeContext, res, format) {
+        if (!routeContext) {
+            return true;
+        }
+
+        const allowedIndices = this._refreshRouteContextAllowedIndices(routeContext);
+        const hasCurrentAvailableAccount =
+            Number.isInteger(this.currentAuthIndex) && this.authSource.availableIndices.includes(this.currentAuthIndex);
+
+        if (!routeContext.isRestrictedModel && hasCurrentAvailableAccount) {
+            return true;
+        }
+
+        if (Number.isInteger(this.currentAuthIndex) && allowedIndices.includes(this.currentAuthIndex)) {
+            return true;
+        }
+
+        if (routeContext.isRestrictedModel && allowedIndices.length === 0) {
+            this._sendInsufficientAccountTierResponse(res, format, routeContext);
+            return false;
+        }
+
+        if (!routeContext.isRestrictedModel && allowedIndices.length === 0) {
+            return true;
+        }
+
+        try {
+            const result = await this.authSwitcher.switchToNextAuth({
+                allowedIndices,
+            });
+            if (result?.success) {
+                this.logger.info(
+                    `[Route] Switched to eligible account #${this.currentAuthIndex} for model "${routeContext.cleanModelName || "unknown"}".`
+                );
+                return true;
+            }
+
+            this._sendApiFormattedErrorResponse(
+                res,
+                format,
+                503,
+                `Service temporarily unavailable: Unable to switch to an eligible account for model "${routeContext.cleanModelName || "unknown"}".`
+            );
+            return false;
+        } catch (error) {
+            this.logger.error(
+                `[Route] Failed to switch to an eligible account for model "${routeContext.cleanModelName || "unknown"}": ${error.message}`
+            );
+            this._sendApiFormattedErrorResponse(
+                res,
+                format,
+                503,
+                `Service temporarily unavailable: Unable to switch to an eligible account for model "${routeContext.cleanModelName || "unknown"}".`
+            );
+            return false;
+        }
+    }
+
+    async _ensureRouteContextReady(res, format, routeContext, waitOptions = {}) {
+        if (routeContext?.isRestrictedModel && this._refreshRouteContextAllowedIndices(routeContext).length === 0) {
+            this._sendInsufficientAccountTierResponse(res, format, routeContext);
+            return false;
+        }
+
+        if (this.authSwitcher.isSystemBusy) {
+            const ready = await this._waitForSystemAndConnectionIfBusy(res, waitOptions);
+            if (!ready) {
+                return false;
+            }
+        }
+
+        const switchedToEligibleAuth = await this._switchToRouteEligibleAuth(routeContext, res, format);
+        if (!switchedToEligibleAuth) {
+            return false;
+        }
+
+        if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
+            this.logger.warn(`[Route] No WebSocket connection for eligible account #${this.currentAuthIndex}`);
+            const recovered = await this._handleBrowserRecovery(res, format, routeContext);
+            if (!recovered) {
+                this._markTrackedEarlyExitIfNeeded(
+                    res,
+                    routeContext?.isRestrictedModel
+                        ? this._buildInsufficientAccountTierMessage(routeContext)
+                        : "Service temporarily unavailable: Browser recovery failed.",
+                    routeContext?.isRestrictedModel ? 403 : 503
+                );
+                return false;
+            }
+        }
+
+        const ready = await this._waitForSystemAndConnectionIfBusy(res, waitOptions);
+        if (!ready) {
+            return false;
+        }
+
+        const switchedAfterWait = await this._switchToRouteEligibleAuth(routeContext, res, format);
+        if (!switchedAfterWait) {
+            return false;
+        }
+
+        if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
+            this.logger.warn(
+                `[Route] Eligible account #${this.currentAuthIndex} is still missing a WebSocket connection.`
+            );
+            const recovered = await this._handleBrowserRecovery(res, format, routeContext);
+            if (!recovered) {
+                this._markTrackedEarlyExitIfNeeded(
+                    res,
+                    routeContext?.isRestrictedModel
+                        ? this._buildInsufficientAccountTierMessage(routeContext)
+                        : "Service temporarily unavailable: Browser recovery failed.",
+                    routeContext?.isRestrictedModel ? 403 : 503
+                );
+                return false;
+            }
+
+            const connectionReady = await this._waitForSystemAndConnectionIfBusy(res, waitOptions);
+            if (!connectionReady) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     _categorizeRequest(pathValue, fallback = "request") {
         if (typeof pathValue !== "string") return fallback;
         if (pathValue.includes("countTokens") || pathValue.includes("input_tokens")) return "count_tokens";
@@ -263,7 +454,7 @@ class RequestHandler {
         return null;
     }
 
-    _recordGenerativeUsage(logLabel = "Generation request") {
+    _recordGenerativeUsage(logLabel = "Generation request", routeContext = null) {
         const usageCount = this.authSwitcher.incrementUsageCount();
         if (usageCount <= 0) {
             return;
@@ -276,7 +467,7 @@ class RequestHandler {
         );
 
         if (this.authSwitcher.shouldSwitchByUsage()) {
-            this.needsSwitchingAfterRequest = true;
+            this.needsSwitchingAfterRequest = this._getRouteSwitchOptions(routeContext);
         }
     }
 
@@ -757,10 +948,11 @@ class RequestHandler {
         return { attemptedAuthIndices };
     }
 
-    async _performImmediateSwitchRetry(errorDetails, requestId, tracker) {
+    async _performImmediateSwitchRetry(errorDetails, requestId, tracker, routeContext = null) {
         const switchResult = await this.authSwitcher.handleRequestFailureAndSwitch(
             { message: errorDetails.message, status: Number(errorDetails.status) },
-            null
+            null,
+            this._getRouteSwitchOptions(routeContext)
         );
 
         const shouldWaitForReady = switchResult?.success || switchResult?.reason === "Switch already in progress.";
@@ -813,7 +1005,7 @@ class RequestHandler {
      *
      * @returns {boolean} true if recovery successful, false otherwise
      */
-    async _handleBrowserRecovery(res, format = "generic") {
+    async _handleBrowserRecovery(res, format = "generic", routeContext = null) {
         const recoveryAllowed = await this._prepareBrowserRecovery(res, format);
         if (!recoveryAllowed) {
             return false;
@@ -847,6 +1039,12 @@ class RequestHandler {
         // Determine if this is first-time startup or actual crash recovery
         const recoveryAuthIndex = this.currentAuthIndex;
         const isFirstTimeStartup = recoveryAuthIndex < 0 && !this.browserManager.browser;
+        const eligibleRecoveryIndices = routeContext
+            ? this._refreshRouteContextAllowedIndices(routeContext)
+            : this.authSource.getRotationIndices();
+        const switchOptions = this._getRouteSwitchOptions(routeContext);
+        const canRecoverCurrentAccount =
+            recoveryAuthIndex >= 0 && (!routeContext || eligibleRecoveryIndices.includes(recoveryAuthIndex));
 
         if (isFirstTimeStartup) {
             this.logger.info(
@@ -862,7 +1060,7 @@ class RequestHandler {
         let recoverySuccess = false;
 
         try {
-            if (recoveryAuthIndex >= 0) {
+            if (canRecoverCurrentAccount) {
                 // Direct recovery: we manage isSystemBusy ourselves
                 wasDirectRecovery = true;
                 this.authSwitcher.isSystemBusy = true;
@@ -879,9 +1077,9 @@ class RequestHandler {
                 }
                 this.logger.info("✅ [System] WebSocket connection is ready!");
                 recoverySuccess = true;
-            } else if (this.authSource.getRotationIndices().length > 0) {
+            } else if (eligibleRecoveryIndices.length > 0) {
                 // Don't set isSystemBusy here - let switchToNextAuth manage it
-                const result = await this.authSwitcher.switchToNextAuth();
+                const result = await this.authSwitcher.switchToNextAuth(switchOptions);
                 if (!result.success) {
                     this.logger.error(`❌ [System] Failed to switch to available account: ${result.reason}`);
                     this._sendApiFormattedErrorResponse(
@@ -905,29 +1103,33 @@ class RequestHandler {
                 }
             } else {
                 this.logger.error("[System] No rotatable accounts are currently available for recovery.");
-                const cooldownDecision = this._buildAllAccountsCoolingDownDecision();
-                if (cooldownDecision) {
-                    this._sendPreflightBlockedResponse(res, format, cooldownDecision);
+                if (routeContext?.isRestrictedModel) {
+                    this._sendInsufficientAccountTierResponse(res, format, routeContext);
                 } else {
-                    this._sendApiFormattedErrorResponse(
-                        res,
-                        format,
-                        503,
-                        "Service temporarily unavailable: No available accounts."
-                    );
+                    const cooldownDecision = this._buildAllAccountsCoolingDownDecision();
+                    if (cooldownDecision) {
+                        this._sendPreflightBlockedResponse(res, format, cooldownDecision);
+                    } else {
+                        this._sendApiFormattedErrorResponse(
+                            res,
+                            format,
+                            503,
+                            "Service temporarily unavailable: No available accounts."
+                        );
+                    }
                 }
                 recoverySuccess = false;
             }
         } catch (error) {
             this.logger.error(`❌ [System] Recovery failed: ${error.message}`);
 
-            if (wasDirectRecovery && this.authSource.getRotationIndices().length > 1) {
+            if (wasDirectRecovery && eligibleRecoveryIndices.length > 1) {
                 this.logger.warn("⚠️ [System] Attempting to switch to alternative account...");
                 // Reset isSystemBusy before calling switchToNextAuth to avoid "already in progress" rejection
                 this.authSwitcher.isSystemBusy = false;
                 wasDirectRecovery = false; // Prevent finally block from resetting again
                 try {
-                    const result = await this.authSwitcher.switchToNextAuth();
+                    const result = await this.authSwitcher.switchToNextAuth(switchOptions);
                     if (!result.success) {
                         this.logger.error(`❌ [System] Failed to switch to alternative account: ${result.reason}`);
                         this._sendApiFormattedErrorResponse(
@@ -961,6 +1163,12 @@ class RequestHandler {
                     );
                     recoverySuccess = false;
                 }
+            } else if (
+                routeContext?.isRestrictedModel &&
+                this._refreshRouteContextAllowedIndices(routeContext).length === 0
+            ) {
+                this._sendInsufficientAccountTierResponse(res, format, routeContext);
+                recoverySuccess = false;
             } else {
                 const cooldownDecision = this._buildAllAccountsCoolingDownDecision();
                 if (cooldownDecision) {
@@ -1011,40 +1219,27 @@ class RequestHandler {
                 return;
             }
 
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res, "generic");
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
-            }
-
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res);
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
             const proxyRequest = this._buildProxyRequest(req, requestId);
             proxyRequest.is_generative = isGenerativeRequest;
             this._initializeProxyRequestAttempt(proxyRequest);
+            const routeContext = this._createRouteContext(this._extractModelFromPath(proxyRequest.path));
+
+            {
+                const routeReady = await this._ensureRouteContextReady(res, "gemini", routeContext);
+                if (!routeReady) {
+                    return;
+                }
+            }
 
             if (isGenerativeRequest) {
-                this._recordGenerativeUsage("Generation request");
+                this._recordGenerativeUsage("Generation request", routeContext);
             }
 
             res.__proxyResponseStreamMode = wantsStream ? proxyRequest.streaming_mode : null;
 
             this._updateTrackedRequest(requestId, {
                 isStreaming: wantsStream,
-                model: this._extractModelFromPath(proxyRequest.path),
+                model: routeContext.cleanModelName || this._extractModelFromPath(proxyRequest.path),
                 path: proxyRequest.path,
                 requestCategory: this._categorizeRequest(
                     proxyRequest.path,
@@ -1067,13 +1262,13 @@ class RequestHandler {
                         `[Request] Client enabled streaming (${proxyRequest.streaming_mode}), entering streaming processing mode...`
                     );
                     if (proxyRequest.streaming_mode === "fake") {
-                        await this._handlePseudoStreamResponse(proxyRequest, messageQueue, req, res);
+                        await this._handlePseudoStreamResponse(proxyRequest, messageQueue, req, res, routeContext);
                     } else {
-                        await this._handleRealStreamResponse(proxyRequest, messageQueue, req, res);
+                        await this._handleRealStreamResponse(proxyRequest, messageQueue, req, res, routeContext);
                     }
                 } else {
                     proxyRequest.streaming_mode = "fake";
-                    await this._handleNonStreamResponse(proxyRequest, messageQueue, req, res);
+                    await this._handleNonStreamResponse(proxyRequest, messageQueue, req, res, routeContext);
                 }
             } catch (error) {
                 // Handle queue timeout by notifying browser
@@ -1083,13 +1278,14 @@ class RequestHandler {
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
                 if (this.needsSwitchingAfterRequest) {
+                    const switchOptions = this.needsSwitchingAfterRequest;
+                    this.needsSwitchingAfterRequest = null;
                     this.logger.info(
                         `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
                     );
-                    this.authSwitcher.switchToNextAuth().catch(err => {
+                    this.authSwitcher.switchToNextAuth(switchOptions).catch(err => {
                         this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
                     });
-                    this.needsSwitchingAfterRequest = false;
                 }
                 if (!res.writableEnded) res.end();
             }
@@ -1193,28 +1389,6 @@ class RequestHandler {
             if (!browserActivityStarted) {
                 return;
             }
-
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res, "openai");
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
-            }
-
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res);
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
             const isOpenAIStream = req.body.stream === true;
             const systemStreamMode = this.serverSystem.streamingMode;
 
@@ -1230,7 +1404,16 @@ class RequestHandler {
                 return this._sendErrorResponse(res, 400, "Invalid OpenAI request format.");
             }
 
-            this._recordGenerativeUsage("OpenAI generation request");
+            const routeContext = this._createRouteContext(model);
+
+            {
+                const routeReady = await this._ensureRouteContextReady(res, "openai", routeContext);
+                if (!routeReady) {
+                    return;
+                }
+            }
+
+            this._recordGenerativeUsage("OpenAI generation request", routeContext);
 
             const effectiveStreamMode = modelStreamingMode || systemStreamMode;
             const useRealStream = isOpenAIStream && effectiveStreamMode === "real";
@@ -1293,7 +1476,8 @@ class RequestHandler {
                             const switched = await this._performImmediateSwitchRetry(
                                 initialMessage,
                                 requestId,
-                                immediateSwitchTracker
+                                immediateSwitchTracker,
+                                routeContext
                             );
                             if (!switched) {
                                 skipFinalFailureSwitch = true;
@@ -1325,7 +1509,11 @@ class RequestHandler {
 
                         // Avoid switching account if the error is just a connection reset
                         if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
-                            await this.authSwitcher.handleRequestFailureAndSwitch(initialMessage, null);
+                            await this.authSwitcher.handleRequestFailureAndSwitch(
+                                initialMessage,
+                                null,
+                                this._getRouteSwitchOptions(routeContext)
+                            );
                         } else if (skipFinalFailureSwitch) {
                             this.logger.info(
                                 "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -1377,7 +1565,7 @@ class RequestHandler {
                     }
 
                     try {
-                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, routeContext);
 
                         if (!result.success) {
                             this._logFinalRequestFailure(result.error, "OpenAI fake/non-stream");
@@ -1392,7 +1580,11 @@ class RequestHandler {
 
                             // Avoid switching account if the error is just a connection reset
                             if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                                await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                                await this.authSwitcher.handleRequestFailureAndSwitch(
+                                    result.error,
+                                    null,
+                                    this._getRouteSwitchOptions(routeContext)
+                                );
                             } else if (result.error.skipAccountSwitch) {
                                 this.logger.info(
                                     "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -1508,13 +1700,14 @@ class RequestHandler {
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
                 if (this.needsSwitchingAfterRequest) {
+                    const switchOptions = this.needsSwitchingAfterRequest;
+                    this.needsSwitchingAfterRequest = null;
                     this.logger.info(
                         `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
                     );
-                    this.authSwitcher.switchToNextAuth().catch(err => {
+                    this.authSwitcher.switchToNextAuth(switchOptions).catch(err => {
                         this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
                     });
-                    this.needsSwitchingAfterRequest = false;
                 }
                 if (!res.writableEnded) res.end();
             }
@@ -1540,28 +1733,6 @@ class RequestHandler {
             browserActivityStarted = await this._beginBrowserBoundRequest(res, "response_api");
             if (!browserActivityStarted) {
                 return;
-            }
-
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res, "response_api");
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
-            }
-
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res);
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
             }
             const isOpenAIStream = req.body.stream === true;
             const normalizeInstructions = value => {
@@ -1627,7 +1798,16 @@ class RequestHandler {
                 return this._sendErrorResponse(res, 400, "Invalid OpenAI Response request format.");
             }
 
-            this._recordGenerativeUsage("OpenAI Response generation request");
+            const routeContext = this._createRouteContext(model);
+
+            {
+                const routeReady = await this._ensureRouteContextReady(res, "response_api", routeContext);
+                if (!routeReady) {
+                    return;
+                }
+            }
+
+            this._recordGenerativeUsage("OpenAI Response generation request", routeContext);
 
             const effectiveStreamMode = modelStreamingMode || systemStreamMode;
             const useRealStream = isOpenAIStream && effectiveStreamMode === "real";
@@ -1691,7 +1871,8 @@ class RequestHandler {
                             const switched = await this._performImmediateSwitchRetry(
                                 initialMessage,
                                 requestId,
-                                immediateSwitchTracker
+                                immediateSwitchTracker,
+                                routeContext
                             );
                             if (!switched) {
                                 skipFinalFailureSwitch = true;
@@ -1723,7 +1904,11 @@ class RequestHandler {
 
                         // Avoid switching account if the error is just a connection reset
                         if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
-                            await this.authSwitcher.handleRequestFailureAndSwitch(initialMessage, null);
+                            await this.authSwitcher.handleRequestFailureAndSwitch(
+                                initialMessage,
+                                null,
+                                this._getRouteSwitchOptions(routeContext)
+                            );
                         } else if (skipFinalFailureSwitch) {
                             this.logger.info(
                                 "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -1777,7 +1962,7 @@ class RequestHandler {
                     }
 
                     try {
-                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, routeContext);
 
                         if (!result.success) {
                             this._logFinalRequestFailure(result.error, "OpenAI Response API fake/non-stream");
@@ -1792,7 +1977,11 @@ class RequestHandler {
 
                             // Avoid switching account if the error is just a connection reset
                             if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                                await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                                await this.authSwitcher.handleRequestFailureAndSwitch(
+                                    result.error,
+                                    null,
+                                    this._getRouteSwitchOptions(routeContext)
+                                );
                             } else if (result.error.skipAccountSwitch) {
                                 this.logger.info(
                                     "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -1923,13 +2112,14 @@ class RequestHandler {
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
                 if (this.needsSwitchingAfterRequest) {
+                    const switchOptions = this.needsSwitchingAfterRequest;
+                    this.needsSwitchingAfterRequest = null;
                     this.logger.info(
                         `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
                     );
-                    this.authSwitcher.switchToNextAuth().catch(err => {
+                    this.authSwitcher.switchToNextAuth(switchOptions).catch(err => {
                         this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
                     });
-                    this.needsSwitchingAfterRequest = false;
                 }
                 if (!res.writableEnded) res.end();
             }
@@ -1956,32 +2146,6 @@ class RequestHandler {
             if (!browserActivityStarted) {
                 return;
             }
-
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res, "claude");
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
-            }
-
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res, {
-                    sendError: (status, message) =>
-                        this._sendClaudeErrorResponse(res, status, "overloaded_error", message),
-                });
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
-
             const isClaudeStream = req.body.stream === true;
             const systemStreamMode = this.serverSystem.streamingMode;
 
@@ -2002,7 +2166,19 @@ class RequestHandler {
                 );
             }
 
-            this._recordGenerativeUsage("Claude generation request");
+            const routeContext = this._createRouteContext(model);
+
+            {
+                const routeReady = await this._ensureRouteContextReady(res, "claude", routeContext, {
+                    sendError: (status, message) =>
+                        this._sendClaudeErrorResponse(res, status, "overloaded_error", message),
+                });
+                if (!routeReady) {
+                    return;
+                }
+            }
+
+            this._recordGenerativeUsage("Claude generation request", routeContext);
 
             const effectiveStreamMode = modelStreamingMode || systemStreamMode;
             const useRealStream = isClaudeStream && effectiveStreamMode === "real";
@@ -2066,7 +2242,8 @@ class RequestHandler {
                             const switched = await this._performImmediateSwitchRetry(
                                 initialMessage,
                                 requestId,
-                                immediateSwitchTracker
+                                immediateSwitchTracker,
+                                routeContext
                             );
                             if (!switched) {
                                 skipFinalFailureSwitch = true;
@@ -2099,7 +2276,11 @@ class RequestHandler {
                             initialMessage.message
                         );
                         if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
-                            await this.authSwitcher.handleRequestFailureAndSwitch(initialMessage, null);
+                            await this.authSwitcher.handleRequestFailureAndSwitch(
+                                initialMessage,
+                                null,
+                                this._getRouteSwitchOptions(routeContext)
+                            );
                         } else if (skipFinalFailureSwitch) {
                             this.logger.info(
                                 "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -2144,7 +2325,7 @@ class RequestHandler {
                     }
 
                     try {
-                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, routeContext);
 
                         if (!result.success) {
                             this._logFinalRequestFailure(result.error, "Claude fake/non-stream");
@@ -2161,7 +2342,11 @@ class RequestHandler {
                                 );
                             }
                             if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                                await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                                await this.authSwitcher.handleRequestFailureAndSwitch(
+                                    result.error,
+                                    null,
+                                    this._getRouteSwitchOptions(routeContext)
+                                );
                             } else if (result.error.skipAccountSwitch) {
                                 this.logger.info(
                                     "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -2275,13 +2460,14 @@ class RequestHandler {
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
                 if (this.needsSwitchingAfterRequest) {
+                    const switchOptions = this.needsSwitchingAfterRequest;
+                    this.needsSwitchingAfterRequest = null;
                     this.logger.info(
                         `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
                     );
-                    this.authSwitcher.switchToNextAuth().catch(err => {
+                    this.authSwitcher.switchToNextAuth(switchOptions).catch(err => {
                         this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
                     });
-                    this.needsSwitchingAfterRequest = false;
                 }
                 if (!res.writableEnded) res.end();
             }
@@ -2308,31 +2494,6 @@ class RequestHandler {
                 return;
             }
 
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res, "claude");
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
-            }
-
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res, {
-                    sendError: (status, message) =>
-                        this._sendClaudeErrorResponse(res, status, "overloaded_error", message),
-                });
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
-
             // Translate Claude format to Google format
             let googleBody, model;
             try {
@@ -2347,6 +2508,18 @@ class RequestHandler {
                     "invalid_request_error",
                     "Invalid Claude request format."
                 );
+            }
+
+            const routeContext = this._createRouteContext(model);
+
+            {
+                const routeReady = await this._ensureRouteContextReady(res, "claude", routeContext, {
+                    sendError: (status, message) =>
+                        this._sendClaudeErrorResponse(res, status, "overloaded_error", message),
+                });
+                if (!routeReady) {
+                    return;
+                }
             }
 
             // Build countTokens request
@@ -2399,7 +2572,11 @@ class RequestHandler {
                     );
                     this._sendClaudeErrorResponse(res, response.status || 500, "api_error", response.message);
                     if (!this._isConnectionResetError(response)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(response, null);
+                        await this.authSwitcher.handleRequestFailureAndSwitch(
+                            response,
+                            null,
+                            this._getRouteSwitchOptions(routeContext)
+                        );
                     }
                     return;
                 }
@@ -2471,28 +2648,6 @@ class RequestHandler {
                 return;
             }
 
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res, "response_api");
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
-            }
-
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res);
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
-
             // Translate OpenAI Response format to Google format (so we can use Gemini countTokens)
             let googleBody, model;
             try {
@@ -2502,6 +2657,15 @@ class RequestHandler {
             } catch (error) {
                 this.logger.error(`[Adapter] OpenAI Response input_tokens translation failed: ${error.message}`);
                 return this._sendErrorResponse(res, 400, "Invalid OpenAI Response request format.");
+            }
+
+            const routeContext = this._createRouteContext(model);
+
+            {
+                const routeReady = await this._ensureRouteContextReady(res, "response_api", routeContext);
+                if (!routeReady) {
+                    return;
+                }
             }
 
             // Gemini countTokens accepts either:
@@ -2555,7 +2719,11 @@ class RequestHandler {
 
                     // Avoid switching account if the error is just a connection reset
                     if (!this._isConnectionResetError(response)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(response, null);
+                        await this.authSwitcher.handleRequestFailureAndSwitch(
+                            response,
+                            null,
+                            this._getRouteSwitchOptions(routeContext)
+                        );
                     } else {
                         this.logger.info(
                             "[Request] Failure due to connection reset (input_tokens), skipping account switch."
@@ -2832,7 +3000,7 @@ class RequestHandler {
         }
     }
 
-    async _handlePseudoStreamResponse(proxyRequest, messageQueue, req, res) {
+    async _handlePseudoStreamResponse(proxyRequest, messageQueue, req, res, routeContext = null) {
         this.logger.info("[Request] Entering pseudo-stream mode...");
 
         // Per user request, convert the backend call to non-streaming.
@@ -2859,7 +3027,7 @@ class RequestHandler {
         scheduleNextKeepAlive();
 
         try {
-            const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+            const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, routeContext);
 
             if (!result.success) {
                 clearTimeout(connectionMaintainer);
@@ -2879,7 +3047,11 @@ class RequestHandler {
 
                     // Avoid switching account if the error is just a connection reset
                     if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                        await this.authSwitcher.handleRequestFailureAndSwitch(
+                            result.error,
+                            null,
+                            this._getRouteSwitchOptions(routeContext)
+                        );
                     } else if (result.error.skipAccountSwitch) {
                         this.logger.info(
                             "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -3117,7 +3289,7 @@ class RequestHandler {
         }
     }
 
-    async _handleRealStreamResponse(proxyRequest, messageQueue, req, res) {
+    async _handleRealStreamResponse(proxyRequest, messageQueue, req, res, routeContext = null) {
         this.logger.info(`[Request] Request dispatched to browser for processing...`);
         let currentQueue = messageQueue;
         let headerMessage;
@@ -3149,7 +3321,8 @@ class RequestHandler {
                 const switched = await this._performImmediateSwitchRetry(
                     headerMessage,
                     proxyRequest.request_id,
-                    immediateSwitchTracker
+                    immediateSwitchTracker,
+                    routeContext
                 );
                 if (!switched) {
                     skipFinalFailureSwitch = true;
@@ -3183,7 +3356,11 @@ class RequestHandler {
                 this._logFinalRequestFailure(headerMessage, "Gemini real stream");
                 // Avoid switching account if the error is just a connection reset
                 if (!skipFinalFailureSwitch && !this._isConnectionResetError(headerMessage)) {
-                    await this.authSwitcher.handleRequestFailureAndSwitch(headerMessage, null);
+                    await this.authSwitcher.handleRequestFailureAndSwitch(
+                        headerMessage,
+                        null,
+                        this._getRouteSwitchOptions(routeContext)
+                    );
                 } else if (skipFinalFailureSwitch) {
                     this.logger.info(
                         "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -3292,11 +3469,11 @@ class RequestHandler {
         }
     }
 
-    async _handleNonStreamResponse(proxyRequest, messageQueue, req, res) {
+    async _handleNonStreamResponse(proxyRequest, messageQueue, req, res, routeContext = null) {
         this.logger.info(`[Request] Entering non-stream processing mode...`);
 
         try {
-            const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+            const result = await this._executeRequestWithRetries(proxyRequest, messageQueue, routeContext);
 
             if (!result.success) {
                 // If retries failed, handle the failure (e.g., switch account)
@@ -3306,7 +3483,11 @@ class RequestHandler {
                     this._logFinalRequestFailure(result.error, "Gemini non-stream");
                     // Avoid switching account if the error is just a connection reset
                     if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                        await this.authSwitcher.handleRequestFailureAndSwitch(
+                            result.error,
+                            null,
+                            this._getRouteSwitchOptions(routeContext)
+                        );
                     } else if (result.error.skipAccountSwitch) {
                         this.logger.info(
                             "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -3418,7 +3599,7 @@ class RequestHandler {
         return fullBody;
     }
 
-    async _executeRequestWithRetries(proxyRequest, messageQueue) {
+    async _executeRequestWithRetries(proxyRequest, messageQueue, routeContext = null) {
         let lastError = null;
         let currentQueue = messageQueue;
         // Track the authIndex for the current queue to ensure proper cleanup
@@ -3513,7 +3694,8 @@ class RequestHandler {
                         const switched = await this._performImmediateSwitchRetry(
                             errorPayload,
                             proxyRequest.request_id,
-                            immediateSwitchTracker
+                            immediateSwitchTracker,
+                            routeContext
                         );
                         if (!switched) {
                             lastError = { ...errorPayload, skipAccountSwitch: true };

@@ -252,6 +252,34 @@
             "thinking": true
         },
         {
+            "name": "models/gemini-3.1-flash-image-preview",
+            "version": "3.1-flash-image-preview",
+            "displayName": "Gemini 3.1 Flash Image Preview",
+            "description": "Gemini 3.1 Flash Image Preview",
+            "inputTokenLimit": 32768,
+            "outputTokenLimit": 32768,
+            "supportedGenerationMethods": ["generateContent", "countTokens", "batchGenerateContent"],
+            "temperature": 1.0,
+            "topP": 0.95,
+            "topK": 64,
+            "maxTemperature": 1.0,
+            "minAccountTier": "pro"
+        },
+        {
+            "name": "models/gemini-3-pro-image-preview",
+            "version": "3-pro-image-preview",
+            "displayName": "Gemini 3 Pro Image Preview",
+            "description": "Gemini 3 Pro Image Preview",
+            "inputTokenLimit": 32768,
+            "outputTokenLimit": 32768,
+            "supportedGenerationMethods": ["generateContent", "countTokens", "batchGenerateContent"],
+            "temperature": 1.0,
+            "topP": 0.95,
+            "topK": 64,
+            "maxTemperature": 1.0,
+            "minAccountTier": "pro"
+        },
+        {
             "name": "models/gemini-robotics-er-1.5-preview",
             "version": "1.5-preview",
             "displayName": "Gemini Robotics-ER 1.5 Preview",
