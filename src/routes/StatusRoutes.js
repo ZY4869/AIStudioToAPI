@@ -703,6 +703,23 @@ class StatusRoutes {
             }
         });
 
+        app.put("/api/settings/sleep-cooldown", isAuthenticated, async (req, res) => {
+            this._recordInteractiveActivity();
+
+            try {
+                const settings = await this.serverSystem.runtimeSettingsManager.updateSleepCooldownSettings(
+                    req.body || {}
+                );
+                res.status(200).json({
+                    message: "sleepCooldownSettingsSaved",
+                    settings,
+                });
+            } catch (error) {
+                this.logger.warn(`[WebUI] Failed to update sleep/cooldown settings: ${error.message}`);
+                res.status(400).json({ error: error.message, message: "settingFailed" });
+            }
+        });
+
         app.post("/api/files", isAuthenticated, async (req, res) => {
             if (this._rejectIfSystemBusy(res)) return;
             this._recordInteractiveActivity();
@@ -942,6 +959,7 @@ class StatusRoutes {
                 maxContexts: config.maxContexts,
                 maxRetries: config.maxRetries,
                 rotationIndicesRaw: rotationIndices,
+                sleepCooldownSettings: this.serverSystem.runtimeSettingsManager.getSleepCooldownSettings(),
                 sleepState: sleepManager ? sleepManager.getStatus() : null,
                 streamingMode: this.serverSystem.streamingMode,
                 usageCount,

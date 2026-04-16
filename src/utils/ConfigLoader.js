@@ -8,6 +8,7 @@
 const fs = require("fs");
 const path = require("path");
 const { getProxySummaryFromEnv } = require("./ProxyUtils");
+const { normalizeSleepCooldownSettings, parseSleepWindows } = require("./SleepSettingsUtils");
 
 /**
  * Configuration Loader Module
@@ -18,46 +19,24 @@ class ConfigLoader {
         this.logger = logger;
     }
 
-    _parseSleepWindows(rawWindows) {
-        if (!rawWindows || typeof rawWindows !== "string") {
-            return [];
+    _loadRuntimeSettingsOverrides() {
+        const runtimeSettingsPath = path.join(process.cwd(), "data", "runtime-settings.json");
+
+        try {
+            if (!fs.existsSync(runtimeSettingsPath)) {
+                return null;
+            }
+
+            const rawContent = fs.readFileSync(runtimeSettingsPath, "utf-8");
+            if (!rawContent.trim()) {
+                return null;
+            }
+
+            return JSON.parse(rawContent);
+        } catch (error) {
+            this.logger.warn(`[Config] Failed to load runtime settings overrides: ${error.message}`);
+            return null;
         }
-
-        return rawWindows
-            .split(",")
-            .map(item => item.trim())
-            .filter(Boolean)
-            .map(item => {
-                const match = item.match(/^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/);
-                if (!match) {
-                    this.logger.warn(`[Config] Ignoring invalid sleep window "${item}". Expected HH:mm-HH:mm.`);
-                    return null;
-                }
-
-                const [, startHourRaw, startMinuteRaw, endHourRaw, endMinuteRaw] = match;
-                const startHour = parseInt(startHourRaw, 10);
-                const startMinute = parseInt(startMinuteRaw, 10);
-                const endHour = parseInt(endHourRaw, 10);
-                const endMinute = parseInt(endMinuteRaw, 10);
-
-                if (
-                    startHour > 23 ||
-                    startMinute > 59 ||
-                    endHour > 23 ||
-                    endMinute > 59 ||
-                    (startHour === endHour && startMinute === endMinute)
-                ) {
-                    this.logger.warn(`[Config] Ignoring invalid sleep window "${item}".`);
-                    return null;
-                }
-
-                return {
-                    endMinutes: endHour * 60 + endMinute,
-                    raw: item,
-                    startMinutes: startHour * 60 + startMinute,
-                };
-            })
-            .filter(Boolean);
     }
 
     loadConfiguration() {
@@ -81,6 +60,7 @@ class ConfigLoader {
             quotaCooldownMinutes: 60,
             retryDelay: 2000,
             sleepWindows: [],
+            sleepWindowsRaw: "",
             streamingMode: "real",
             switchOnUses: 40,
             timezone: process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -146,7 +126,31 @@ class ConfigLoader {
             config.quotaCooldownMinutes = Number.isFinite(parsed) ? Math.max(1, parsed) : config.quotaCooldownMinutes;
         }
         if (process.env.SLEEP_WINDOWS) {
-            config.sleepWindows = this._parseSleepWindows(process.env.SLEEP_WINDOWS);
+            config.sleepWindowsRaw = process.env.SLEEP_WINDOWS;
+        }
+
+        config.sleepWindows = parseSleepWindows(config.sleepWindowsRaw, {
+            logger: this.logger,
+        });
+
+        const runtimeSettingsOverrides = this._loadRuntimeSettingsOverrides();
+        if (runtimeSettingsOverrides) {
+            try {
+                const normalizedRuntimeSettings = normalizeSleepCooldownSettings(runtimeSettingsOverrides, config, {
+                    logger: this.logger,
+                    strict: true,
+                });
+
+                config.autoSleepEnabled = normalizedRuntimeSettings.autoSleepEnabled;
+                config.idleSleepMinutes = normalizedRuntimeSettings.idleSleepMinutes;
+                config.quotaCooldownMinutes = normalizedRuntimeSettings.quotaCooldownMinutes;
+                config.sleepWindows = normalizedRuntimeSettings.sleepWindows;
+                config.sleepWindowsRaw = normalizedRuntimeSettings.sleepWindowsRaw;
+
+                this.logger.info("[Config] Loaded sleep/cooldown settings overrides from data/runtime-settings.json.");
+            } catch (error) {
+                this.logger.warn(`[Config] Ignoring invalid runtime settings overrides: ${error.message}`);
+            }
         }
 
         let rawCodes = process.env.IMMEDIATE_SWITCH_STATUS_CODES;

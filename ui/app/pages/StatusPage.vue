@@ -326,6 +326,29 @@
                                     {{ formatDateTime(state.sleepState.nextWakeAt) }}
                                 </span>
                             </div>
+                            <div v-else class="status-item">
+                                <span class="label">
+                                    <svg
+                                        xmlns="http://www.w3.org/2000/svg"
+                                        width="14"
+                                        height="14"
+                                        viewBox="0 0 24 24"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        stroke-width="2"
+                                        stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                        style="margin-right: 6px"
+                                    >
+                                        <path d="M12 6v6l4 2"></path>
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                    </svg>
+                                    {{ t("sleepCountdown") }}
+                                </span>
+                                <span class="value">
+                                    {{ idleSleepCountdownText }}
+                                </span>
+                            </div>
                             <div class="status-item">
                                 <span class="label">
                                     <svg
@@ -949,61 +972,6 @@
                             </div>
                         </div>
                     </div>
-
-                    <div class="status-card">
-                        <h3 class="card-title">
-                            <svg
-                                xmlns="http://www.w3.org/2000/svg"
-                                width="18"
-                                height="18"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                stroke-width="2"
-                                stroke-linecap="round"
-                                stroke-linejoin="round"
-                                style="margin-right: 8px; vertical-align: text-bottom"
-                            >
-                                <path d="M12 6v6l4 2"></path>
-                                <circle cx="12" cy="12" r="10"></circle>
-                            </svg>
-                            {{ t("sleepCooldown") }}
-                        </h3>
-                        <div class="status-list">
-                            <div class="status-item">
-                                <span class="label">{{ t("sleeping") }}</span>
-                                <span class="value status-text-bold" :class="sleepStatusClass">{{
-                                    sleepStatusText
-                                }}</span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">{{ t("nextWakeAt") }}</span>
-                                <span class="value">{{ formatDateTime(state.sleepState.nextWakeAt) }}</span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">{{ t("cooldownUntil") }}</span>
-                                <span class="value">
-                                    {{
-                                        state.cooldownSummary.earliestAvailableAt
-                                            ? formatDateTime(state.cooldownSummary.earliestAvailableAt)
-                                            : "-"
-                                    }}
-                                </span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">{{ t("idleSleep") }}</span>
-                                <span class="value">{{ state.sleepState.idleSleepMinutes || 0 }} min</span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">{{ t("scheduleWindows") }}</span>
-                                <span class="value">{{ sleepWindowsText }}</span>
-                            </div>
-                            <div class="status-item">
-                                <span class="label">{{ t("timezoneLabel") }}</span>
-                                <span class="value">{{ state.sleepState.timezone || "-" }}</span>
-                            </div>
-                        </div>
-                    </div>
                 </div>
             </div>
 
@@ -1514,6 +1482,112 @@
                                     :width="50"
                                     :before-change="handleForceUrlContextBeforeChange"
                                 />
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="status-card">
+                        <h3 class="card-title">
+                            <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                width="18"
+                                height="18"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                style="margin-right: 8px; vertical-align: text-bottom"
+                            >
+                                <path d="M12 6v6l4 2"></path>
+                                <circle cx="12" cy="12" r="10"></circle>
+                            </svg>
+                            {{ t("sleepCooldown") }}
+                        </h3>
+                        <div class="status-list">
+                            <div class="status-item">
+                                <span class="label">{{ t("sleeping") }}</span>
+                                <span class="value status-text-bold" :class="sleepStatusClass">{{
+                                    sleepStatusText
+                                }}</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("sleepCountdown") }}</span>
+                                <span class="value">{{ idleSleepCountdownText }}</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("nextWakeAt") }}</span>
+                                <span class="value">{{ formatDateTime(state.sleepState.nextWakeAt) }}</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("cooldownUntil") }}</span>
+                                <span class="value">
+                                    {{
+                                        state.cooldownSummary.earliestAvailableAt
+                                            ? formatDateTime(state.cooldownSummary.earliestAvailableAt)
+                                            : "-"
+                                    }}
+                                </span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("autoSleepEnabled") }}</span>
+                                <el-switch
+                                    v-model="state.sleepCooldownForm.autoSleepEnabled"
+                                    :width="50"
+                                    @change="markSleepCooldownFormTouched"
+                                />
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("idleSleep") }}</span>
+                                <el-input-number
+                                    v-model="state.sleepCooldownForm.idleSleepMinutes"
+                                    :min="0"
+                                    :max="10080"
+                                    style="width: 160px"
+                                    @change="markSleepCooldownFormTouched"
+                                />
+                            </div>
+                            <div class="status-item settings-form-row">
+                                <span class="label">{{ t("scheduleWindows") }}</span>
+                                <div class="settings-field">
+                                    <el-input
+                                        v-model="state.sleepCooldownForm.sleepWindowsRaw"
+                                        :placeholder="t('sleepWindowsPlaceholder')"
+                                        @input="markSleepCooldownFormTouched"
+                                    />
+                                    <span class="settings-hint">{{ t("sleepWindowsHint") }}</span>
+                                </div>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("quotaCooldownMinutes") }}</span>
+                                <el-input-number
+                                    v-model="state.sleepCooldownForm.quotaCooldownMinutes"
+                                    :min="1"
+                                    :max="10080"
+                                    style="width: 160px"
+                                    @change="markSleepCooldownFormTouched"
+                                />
+                            </div>
+                            <div class="status-item">
+                                <span class="label">{{ t("timezoneLabel") }}</span>
+                                <span class="value">{{ state.sleepCooldownSettings.timezone || "-" }}</span>
+                            </div>
+                            <div class="settings-actions">
+                                <el-button
+                                    type="primary"
+                                    :disabled="!sleepCooldownFormDirty || state.isSleepCooldownSaving"
+                                    :loading="state.isSleepCooldownSaving"
+                                    @click="saveSleepCooldownSettings"
+                                >
+                                    {{ t("save") }}
+                                </el-button>
+                                <el-button
+                                    :disabled="!sleepCooldownFormDirty || state.isSleepCooldownSaving"
+                                    @click="resetSleepCooldownForm"
+                                >
+                                    {{ t("reset") }}
+                                </el-button>
                             </div>
                         </div>
                     </div>
@@ -2703,6 +2777,7 @@ import EnvVarTooltip from "../components/EnvVarTooltip.vue";
 const router = useRouter();
 const fileInput = ref(null);
 const activeTab = ref("home");
+const countdownNowMs = ref(Date.now());
 
 // Create reactive version counter
 const langVersion = ref(0);
@@ -3320,6 +3395,33 @@ const formatRemainingDuration = value => {
     return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
 };
 
+const formatCountdownDuration = value => {
+    const ms = Number(value);
+    if (!Number.isFinite(ms) || ms <= 0) return "0s";
+
+    const totalSeconds = Math.ceil(ms / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    if (hours > 0) {
+        return `${hours}h ${minutes}m ${seconds}s`;
+    }
+
+    if (minutes > 0) {
+        return `${minutes}m ${seconds}s`;
+    }
+
+    return `${seconds}s`;
+};
+
+const normalizeSleepWindowsText = value =>
+    String(value || "")
+        .split(",")
+        .map(item => item.trim())
+        .filter(Boolean)
+        .join(",");
+
 const formatDuration = value => {
     const duration = Number(value);
     if (!Number.isFinite(duration)) return "-";
@@ -3579,6 +3681,32 @@ const switchTab = tabName => {
 
 const { theme, setTheme } = useTheme();
 
+const createDefaultSleepCooldownSettings = () => ({
+    autoSleepEnabled: false,
+    idleSleepMinutes: 30,
+    quotaCooldownMinutes: 60,
+    sleepWindows: [],
+    sleepWindowsRaw: "",
+    timezone: null,
+});
+
+const createDefaultSleepState = () => ({
+    activeRequestCount: 0,
+    autoSleepEnabled: false,
+    idleCountdownRemainingMs: null,
+    idleSleepDeadlineAt: null,
+    idleSleepMinutes: 0,
+    isSleeping: false,
+    lastActivityAt: null,
+    nextWakeAt: null,
+    pendingScheduleSleep: false,
+    preferredWakeAuthIndex: null,
+    sleepReason: null,
+    sleepWindows: [],
+    sleepWindowsRaw: "",
+    timezone: null,
+});
+
 const state = reactive({
     accountDetails: [],
     activeContextsCount: 0,
@@ -3597,6 +3725,7 @@ const state = reactive({
     forceUrlContextEnabled: false,
     forceWebSearchEnabled: false,
     hasUpdate: false,
+    isSleepCooldownSaving: false,
     isSwitchingAccount: false,
     isSystemBusy: false,
     isUpdating: false,
@@ -3610,17 +3739,15 @@ const state = reactive({
     releaseUrl: null,
     selectedAccounts: new Set(), // Selected account indices
     serviceConnected: false,
-    sleepState: {
-        idleSleepMinutes: 0,
-        isSleeping: false,
-        lastActivityAt: null,
-        nextWakeAt: null,
-        pendingScheduleSleep: false,
-        preferredWakeAuthIndex: null,
-        sleepReason: null,
-        sleepWindows: [],
-        timezone: null,
+    sleepCooldownForm: {
+        autoSleepEnabled: false,
+        idleSleepMinutes: 30,
+        quotaCooldownMinutes: 60,
+        sleepWindowsRaw: "",
     },
+    sleepCooldownFormTouched: false,
+    sleepCooldownSettings: createDefaultSleepCooldownSettings(),
+    sleepState: createDefaultSleepState(),
     streamingModeReal: false,
     // theme: handled by useTheme
     usageCount: 0,
@@ -3664,9 +3791,46 @@ const sleepStatusText = computed(() => {
     return t("sleeping");
 });
 
-const sleepWindowsText = computed(() => {
-    const windows = state.sleepState.sleepWindows || [];
-    return windows.length > 0 ? windows.join(", ") : "-";
+const sleepCooldownFormDirty = computed(() => {
+    const current = {
+        autoSleepEnabled: state.sleepCooldownForm.autoSleepEnabled === true,
+        idleSleepMinutes: Number(state.sleepCooldownForm.idleSleepMinutes),
+        quotaCooldownMinutes: Number(state.sleepCooldownForm.quotaCooldownMinutes),
+        sleepWindowsRaw: normalizeSleepWindowsText(state.sleepCooldownForm.sleepWindowsRaw),
+    };
+    const saved = {
+        autoSleepEnabled: state.sleepCooldownSettings.autoSleepEnabled === true,
+        idleSleepMinutes: Number(state.sleepCooldownSettings.idleSleepMinutes),
+        quotaCooldownMinutes: Number(state.sleepCooldownSettings.quotaCooldownMinutes),
+        sleepWindowsRaw: normalizeSleepWindowsText(state.sleepCooldownSettings.sleepWindowsRaw),
+    };
+
+    return JSON.stringify(current) !== JSON.stringify(saved);
+});
+
+const idleSleepCountdownText = computed(() => {
+    if (state.sleepState.isSleeping) {
+        return "-";
+    }
+
+    if (!state.sleepState.autoSleepEnabled) {
+        return t("disabled");
+    }
+
+    if (state.sleepState.pendingScheduleSleep) {
+        return t("sleepReasonSchedule");
+    }
+
+    if (state.sleepState.activeRequestCount > 0) {
+        return t("sleepCountdownBusy");
+    }
+
+    if (!state.sleepState.idleSleepDeadlineAt) {
+        return "-";
+    }
+
+    const remainingMs = new Date(state.sleepState.idleSleepDeadlineAt).getTime() - countdownNowMs.value;
+    return formatCountdownDuration(remainingMs);
 });
 
 // Total scanned accounts count
@@ -3985,7 +4149,11 @@ const getAccountTooltipContent = account => {
         return baseName;
     }
 
-    return `${baseName} | ${t("cooldownUntil")}: ${formatDateTime(account.cooldownUntil)} | ${t("cooldownRemaining")}: ${formatRemainingDuration(account.cooldownRemainingMs)}`;
+    const remainingMs = account.cooldownUntil
+        ? new Date(account.cooldownUntil).getTime() - countdownNowMs.value
+        : account.cooldownRemainingMs;
+
+    return `${baseName} | ${t("cooldownUntil")}: ${formatDateTime(account.cooldownUntil)} | ${t("cooldownRemaining")}: ${formatRemainingDuration(remainingMs)}`;
 };
 
 const addUser = () => {
@@ -4154,6 +4322,61 @@ const handleLogMaxCountChange = val => {
         .catch(err => {
             ElMessage.error(t("settingFailed", { message: err.message || err }));
         });
+};
+
+const syncSleepCooldownForm = settings => {
+    state.sleepCooldownForm.autoSleepEnabled = settings.autoSleepEnabled === true;
+    state.sleepCooldownForm.idleSleepMinutes = settings.idleSleepMinutes ?? 30;
+    state.sleepCooldownForm.quotaCooldownMinutes = settings.quotaCooldownMinutes ?? 60;
+    state.sleepCooldownForm.sleepWindowsRaw = settings.sleepWindowsRaw || "";
+};
+
+const markSleepCooldownFormTouched = () => {
+    state.sleepCooldownFormTouched = true;
+};
+
+const resetSleepCooldownForm = () => {
+    syncSleepCooldownForm(state.sleepCooldownSettings);
+    state.sleepCooldownFormTouched = false;
+};
+
+const saveSleepCooldownSettings = async () => {
+    if (state.isSleepCooldownSaving || !sleepCooldownFormDirty.value) {
+        return false;
+    }
+
+    state.isSleepCooldownSaving = true;
+
+    try {
+        const res = await fetch("/api/settings/sleep-cooldown", {
+            body: JSON.stringify({
+                autoSleepEnabled: state.sleepCooldownForm.autoSleepEnabled === true,
+                idleSleepMinutes: Number(state.sleepCooldownForm.idleSleepMinutes),
+                quotaCooldownMinutes: Number(state.sleepCooldownForm.quotaCooldownMinutes),
+                sleepWindowsRaw: normalizeSleepWindowsText(state.sleepCooldownForm.sleepWindowsRaw),
+            }),
+            headers: { "Content-Type": "application/json" },
+            method: "PUT",
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+            ElMessage.error(getApiErrorMessage(data));
+            return false;
+        }
+
+        state.sleepCooldownSettings = data.settings || createDefaultSleepCooldownSettings();
+        syncSleepCooldownForm(state.sleepCooldownSettings);
+        state.sleepCooldownFormTouched = false;
+        ElMessage.success(t(data.message || "sleepCooldownSettingsSaved"));
+        updateContent();
+        return true;
+    } catch (err) {
+        ElMessage.error(t("settingFailed", { message: err.message || err }));
+        return false;
+    } finally {
+        state.isSleepCooldownSaving = false;
+    }
 };
 
 const handleLanguageChange = lang => {
@@ -4351,23 +4574,17 @@ const updateStatus = data => {
         cooledDownIndicesRaw: [],
         earliestAvailableAt: null,
     };
+    state.sleepCooldownSettings = data.status.sleepCooldownSettings || createDefaultSleepCooldownSettings();
+    if (!state.sleepCooldownFormTouched && !state.isSleepCooldownSaving) {
+        syncSleepCooldownForm(state.sleepCooldownSettings);
+    }
     state.usageCount = data.status.usageCount;
     state.failureCount = data.status.failureCount;
     state.logCount = data.logCount || 0;
     state.logMaxCount = data.status.logMaxCount || 100;
     state.logs = data.logs || "";
     state.isSystemBusy = data.status.isSystemBusy;
-    state.sleepState = data.status.sleepState || {
-        idleSleepMinutes: 0,
-        isSleeping: false,
-        lastActivityAt: null,
-        nextWakeAt: null,
-        pendingScheduleSleep: false,
-        preferredWakeAuthIndex: null,
-        sleepReason: null,
-        sleepWindows: [],
-        timezone: null,
-    };
+    state.sleepState = data.status.sleepState || createDefaultSleepState();
 
     nextTick(() => {
         state.isUpdating = false;
@@ -4375,6 +4592,7 @@ const updateStatus = data => {
 };
 
 let updateTimer = null;
+let countdownTimer = null;
 let isActive = true;
 
 const updateContent = async () => {
@@ -4761,6 +4979,10 @@ onMounted(() => {
     syncStatsFiltersViewport(statsFiltersMobileMediaQuery);
     statsFiltersMobileMediaQuery.addEventListener("change", syncStatsFiltersViewport);
 
+    countdownTimer = setInterval(() => {
+        countdownNowMs.value = Date.now();
+    }, 1000);
+
     updateContent().finally(scheduleUpdate);
     fetchUsageStats().finally(scheduleUpdate);
 
@@ -4773,6 +4995,9 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
     isActive = false;
+    if (countdownTimer) {
+        clearInterval(countdownTimer);
+    }
     if (updateTimer) {
         clearTimeout(updateTimer);
     }
@@ -5389,12 +5614,61 @@ watchEffect(() => {
     gap: 12px;
 }
 
+.settings-form-row {
+    align-items: flex-start;
+}
+
+.settings-field {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+    width: 100%;
+    max-width: 320px;
+}
+
+.settings-hint {
+    color: @text-secondary;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    text-align: right;
+}
+
+.settings-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 8px;
+}
+
 .switch-container {
     display: flex;
     justify-content: space-between;
     align-items: center;
     font-size: 0.95rem;
     min-height: 32px;
+}
+
+@media (max-width: 767px) {
+    .settings-form-row,
+    .switch-container {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    .settings-field {
+        align-items: stretch;
+        max-width: none;
+    }
+
+    .settings-hint {
+        text-align: left;
+    }
+
+    .settings-actions {
+        justify-content: stretch;
+    }
 }
 
 /* Logs View Specifics */

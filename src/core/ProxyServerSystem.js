@@ -20,6 +20,7 @@ const AuthSource = require("../auth/AuthSource");
 const BrowserManager = require("./BrowserManager");
 const ConnectionRegistry = require("./ConnectionRegistry");
 const RequestHandler = require("./RequestHandler");
+const RuntimeSettingsManager = require("./RuntimeSettingsManager");
 const SleepManager = require("./SleepManager");
 const UsageStatsService = require("./UsageStatsService");
 const ConfigLoader = require("../utils/ConfigLoader");
@@ -113,6 +114,7 @@ class ProxyServerSystem extends EventEmitter {
             this.authSource
         );
         this.sleepManager = new SleepManager(this.logger, this.config, this.browserManager, this.authSource);
+        this.runtimeSettingsManager = new RuntimeSettingsManager(this.logger, this.config, this.sleepManager);
         this.sleepManager.setRequestHandler(this.requestHandler);
 
         this.httpServer = null;
