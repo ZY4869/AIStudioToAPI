@@ -13,13 +13,20 @@ const AuthSwitcher = require("../auth/AuthSwitcher");
 const FormatConverter = require("./FormatConverter");
 const { isUserAbortedError } = require("../utils/CustomErrors");
 const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue");
-const { DEFAULT_ACCOUNT_TIER, getModelMinAccountTier } = require("../utils/AccountTierUtils");
+const {
+    DEFAULT_ACCOUNT_TIER,
+    DEFAULT_QUOTA_CATEGORY,
+    getModelMinAccountTier,
+    getModelQuotaCategory,
+} = require("../utils/AccountTierUtils");
+const { isQuotaExhaustedError } = require("../utils/QuotaCooldownClassifier");
 
 // Timeout constants (in milliseconds)
 const TIMEOUTS = {
     FAKE_STREAM: 300000, // 300 seconds (5 minutes) - timeout for fake streaming (buffered response)
     STREAM_CHUNK: 60000, // 60 seconds - timeout between stream chunks
 };
+const MAX_FAILOVER_ATTEMPTS_PER_ACCOUNT = 2;
 
 class RequestHandler {
     constructor(serverSystem, connectionRegistry, logger, browserManager, config, authSource) {
@@ -31,7 +38,13 @@ class RequestHandler {
         this.authSource = authSource;
 
         // Initialize sub-modules
-        this.authSwitcher = new AuthSwitcher(logger, config, authSource, browserManager);
+        this.authSwitcher = new AuthSwitcher(
+            logger,
+            config,
+            authSource,
+            browserManager,
+            this.serverSystem.accountQuotaService || null
+        );
         this.formatConverter = new FormatConverter(logger, serverSystem);
 
         this.maxRetries = this.config.maxRetries;
@@ -65,6 +78,14 @@ class RequestHandler {
 
     _getSleepManager() {
         return this.serverSystem.sleepManager || null;
+    }
+
+    _getAccountQuotaService() {
+        return this.serverSystem.accountQuotaService || null;
+    }
+
+    _ensureDailyQuotaStateSync() {
+        this._getAccountQuotaService()?.ensureDailyStateSync();
     }
 
     _getAccountNameForIndex(authIndex) {
@@ -225,16 +246,177 @@ class RequestHandler {
         return match?.[1] || null;
     }
 
+    _getRouteNextResetAtIso() {
+        return this._getAccountQuotaService()?.getNextResetAtIso?.() || null;
+    }
+
     _refreshRouteContextAllowedIndices(routeContext) {
         if (!routeContext) {
             return [];
         }
 
-        routeContext.allowedIndices = this.authSource.getEligibleRotationIndices(routeContext.requiredTier);
+        routeContext.configuredIndices = this.authSource.getAvailableIndicesByTier(routeContext.requiredTier, {
+            includeCooldown: true,
+            includeExpired: false,
+            rotationOnly: true,
+        });
+        routeContext.rotatableIndices = this.authSource.getAvailableIndicesByTier(routeContext.requiredTier, {
+            includeCooldown: false,
+            includeExpired: false,
+            rotationOnly: true,
+        });
+
+        const quotaService = this._getAccountQuotaService();
+        routeContext.allowedIndices =
+            routeContext.countsTowardQuota && quotaService
+                ? routeContext.rotatableIndices.filter(index =>
+                      quotaService.hasRemainingQuota(index, routeContext.quotaCategory)
+                  )
+                : [...routeContext.rotatableIndices];
+
         return routeContext.allowedIndices;
     }
 
-    _createRouteContext(modelName) {
+    _getRouteFailoverAttemptCount(routeContext, authIndex) {
+        if (!routeContext?.failoverLedger || !Number.isInteger(authIndex)) {
+            return 0;
+        }
+
+        return routeContext.failoverLedger.get(authIndex) || 0;
+    }
+
+    _recordRouteFailoverAttempt(routeContext, authIndex) {
+        if (!routeContext?.failoverLedger || !Number.isInteger(authIndex)) {
+            return 0;
+        }
+
+        const nextAttemptCount = this._getRouteFailoverAttemptCount(routeContext, authIndex) + 1;
+        routeContext.failoverLedger.set(authIndex, nextAttemptCount);
+        this.logger.info(
+            `[Route] Recorded recoverable failover attempt ${nextAttemptCount}/${MAX_FAILOVER_ATTEMPTS_PER_ACCOUNT} for account #${authIndex} on model "${routeContext.cleanModelName || "unknown"}".`
+        );
+        return nextAttemptCount;
+    }
+
+    _getRouteFailoverAllowedIndices(routeContext) {
+        if (!routeContext) {
+            return [];
+        }
+
+        return this._refreshRouteContextAllowedIndices(routeContext).filter(
+            index => this._getRouteFailoverAttemptCount(routeContext, index) < MAX_FAILOVER_ATTEMPTS_PER_ACCOUNT
+        );
+    }
+
+    _buildRouteQuotaExceededMessage(routeContext) {
+        const modelLabel = routeContext?.cleanModelName ? ` for model "${routeContext.cleanModelName}"` : "";
+        const resetAt = this._getRouteNextResetAtIso();
+        const resetHint = resetAt
+            ? ` It will reset at Pacific Time midnight (America/Los_Angeles, next reset: ${resetAt}).`
+            : " It will reset at Pacific Time midnight (America/Los_Angeles).";
+        return `All eligible accounts${modelLabel} have reached the local limit or are temporarily exhausted.${resetHint}`;
+    }
+
+    _buildRouteSwitchUnavailableMessage(routeContext) {
+        return `Service temporarily unavailable: Unable to switch to an eligible account for model "${routeContext?.cleanModelName || "unknown"}".`;
+    }
+
+    _buildRouteExhaustedErrorPayload(routeContext, reason = "all_accounts_temporarily_exhausted") {
+        return {
+            details: {
+                localRouteError: true,
+                model: routeContext?.cleanModelName || null,
+                nextResetAt: this._getRouteNextResetAtIso(),
+                quotaCategory: routeContext?.quotaCategory || DEFAULT_QUOTA_CATEGORY,
+                reason,
+                requiredTier: routeContext?.requiredTier || DEFAULT_ACCOUNT_TIER,
+                statusText: "RESOURCE_EXHAUSTED",
+            },
+            message: this._buildRouteQuotaExceededMessage(routeContext),
+            status: 429,
+        };
+    }
+
+    _getRouteAvailabilityError(routeContext) {
+        if (!routeContext) {
+            return null;
+        }
+
+        this._refreshRouteContextAllowedIndices(routeContext);
+        if (routeContext.isRestrictedModel && routeContext.configuredIndices.length === 0) {
+            return {
+                details: {
+                    errorType: "permission_denied",
+                    localRouteError: true,
+                    model: routeContext.cleanModelName || null,
+                    reason: "insufficient_account_tier",
+                    requiredTier: routeContext.requiredTier || DEFAULT_ACCOUNT_TIER,
+                    statusText: "PERMISSION_DENIED",
+                },
+                message: this._buildInsufficientAccountTierMessage(routeContext),
+                status: 403,
+            };
+        }
+
+        if (routeContext.configuredIndices.length > 0 && routeContext.allowedIndices.length === 0) {
+            return this._buildRouteExhaustedErrorPayload(routeContext, "all_accounts_temporarily_exhausted");
+        }
+
+        return null;
+    }
+
+    _getRouteFailoverError(routeContext) {
+        const availabilityError = this._getRouteAvailabilityError(routeContext);
+        if (availabilityError) {
+            return availabilityError;
+        }
+
+        if (!routeContext) {
+            return null;
+        }
+
+        if (this._getRouteFailoverAllowedIndices(routeContext).length === 0) {
+            return this._buildRouteExhaustedErrorPayload(routeContext, "all_accounts_failover_exhausted");
+        }
+
+        return null;
+    }
+
+    _sendRouteErrorResponse(res, format, errorPayload) {
+        if (!errorPayload) {
+            return;
+        }
+
+        if (errorPayload.status === 403 && errorPayload.details?.reason === "insufficient_account_tier") {
+            this.logger.warn(
+                `[Route] Blocking model "${errorPayload.details?.model || "unknown"}" locally: required tier "${errorPayload.details?.requiredTier}", allowed accounts [${errorPayload.details?.allowedIndices?.join(", ") || ""}]`
+            );
+        } else if (errorPayload.status === 429) {
+            this.logger.warn(
+                `[Route] Returning local 429 for model "${errorPayload.details?.model || "unknown"}": ${errorPayload.details?.reason || "resource_exhausted"}`
+            );
+        }
+
+        this._sendApiFormattedErrorResponse(
+            res,
+            format,
+            errorPayload.status,
+            errorPayload.message,
+            errorPayload.details
+        );
+    }
+
+    _sendRouteFailureIfNeeded(res, format, routeContext, errorPayload) {
+        const effectiveError = errorPayload || this._getRouteAvailabilityError(routeContext);
+        if (!effectiveError) {
+            return false;
+        }
+
+        this._sendRouteErrorResponse(res, format, effectiveError);
+        return true;
+    }
+
+    _createRouteContext(modelName, options = {}) {
         const cleanModelName =
             typeof modelName === "string" && modelName.startsWith("models/")
                 ? modelName.replace(/^models\//, "")
@@ -242,30 +424,43 @@ class RequestHandler {
         const requiredTier = cleanModelName
             ? getModelMinAccountTier(this.config.modelList, cleanModelName)
             : DEFAULT_ACCOUNT_TIER;
+        const quotaCategory = cleanModelName
+            ? getModelQuotaCategory(this.config.modelList, cleanModelName)
+            : DEFAULT_QUOTA_CATEGORY;
         const routeContext = {
             allowedIndices: [],
             cleanModelName: cleanModelName || null,
+            configuredIndices: [],
+            countsTowardQuota: options.countsTowardQuota === true,
+            failoverLedger: new Map(),
             isRestrictedModel: requiredTier !== DEFAULT_ACCOUNT_TIER,
+            quotaCategory,
             requiredTier,
+            rotatableIndices: [],
         };
 
         this._refreshRouteContextAllowedIndices(routeContext);
         if (routeContext.cleanModelName) {
             this.logger.info(
-                `[Route] Model "${routeContext.cleanModelName}" requires tier "${routeContext.requiredTier}". Allowed accounts: [${routeContext.allowedIndices.join(", ")}]`
+                `[Route] Model "${routeContext.cleanModelName}" requires tier "${routeContext.requiredTier}", quotaCategory="${routeContext.quotaCategory}", countsTowardQuota=${routeContext.countsTowardQuota}. Configured accounts: [${routeContext.configuredIndices.join(", ")}], allowed accounts: [${routeContext.allowedIndices.join(", ")}]`
             );
         }
 
         return routeContext;
     }
 
-    _getRouteSwitchOptions(routeContext) {
+    _getRouteSwitchOptions(routeContext, options = {}) {
         if (!routeContext) {
             return {};
         }
 
+        const { applyFailoverLedger = false } = options;
         return {
-            allowedIndices: [...this._refreshRouteContextAllowedIndices(routeContext)],
+            allowedIndices: [
+                ...(applyFailoverLedger
+                    ? this._getRouteFailoverAllowedIndices(routeContext)
+                    : this._refreshRouteContextAllowedIndices(routeContext)),
+            ],
         };
     }
 
@@ -276,17 +471,91 @@ class RequestHandler {
     }
 
     _sendInsufficientAccountTierResponse(res, format, routeContext) {
-        const message = this._buildInsufficientAccountTierMessage(routeContext);
-        this.logger.warn(
-            `[Route] Blocking model "${routeContext?.cleanModelName || "unknown"}" locally: required tier "${routeContext?.requiredTier}", allowed accounts [${routeContext?.allowedIndices?.join(", ") || ""}]`
-        );
-        this._sendApiFormattedErrorResponse(res, format, 403, message, {
-            errorType: "permission_denied",
-            model: routeContext?.cleanModelName || null,
-            reason: "insufficient_account_tier",
-            requiredTier: routeContext?.requiredTier || DEFAULT_ACCOUNT_TIER,
-            statusText: "PERMISSION_DENIED",
+        this._sendRouteFailureIfNeeded(res, format, routeContext, {
+            details: {
+                errorType: "permission_denied",
+                model: routeContext?.cleanModelName || null,
+                reason: "insufficient_account_tier",
+                requiredTier: routeContext?.requiredTier || DEFAULT_ACCOUNT_TIER,
+                statusText: "PERMISSION_DENIED",
+            },
+            message: this._buildInsufficientAccountTierMessage(routeContext),
+            status: 403,
         });
+    }
+
+    async _ensureCurrentRouteAttemptCandidate(routeContext) {
+        if (!routeContext) {
+            return { success: true };
+        }
+
+        const routeError = this._getRouteFailoverError(routeContext);
+        if (routeError) {
+            return { error: routeError, success: false };
+        }
+
+        const allowedIndices = this._getRouteFailoverAllowedIndices(routeContext);
+        if (Number.isInteger(this.currentAuthIndex) && allowedIndices.includes(this.currentAuthIndex)) {
+            return { success: true };
+        }
+
+        try {
+            const result = await this.authSwitcher.switchToNextAuth({
+                allowedIndices,
+            });
+            if (!result?.success) {
+                return {
+                    error: {
+                        details: {
+                            localRouteError: true,
+                            reason: "route_switch_unavailable",
+                            statusText: "UNAVAILABLE",
+                        },
+                        message: this._buildRouteSwitchUnavailableMessage(routeContext),
+                        status: 503,
+                    },
+                    success: false,
+                };
+            }
+
+            const ready = await this._waitForSystemAndConnectionIfBusy(null, {
+                sendError: () => {},
+            });
+            if (!ready) {
+                return {
+                    error: {
+                        details: {
+                            reason: "route_switch_unavailable",
+                            statusText: "UNAVAILABLE",
+                        },
+                        message: this._buildRouteSwitchUnavailableMessage(routeContext),
+                        status: 503,
+                    },
+                    success: false,
+                };
+            }
+
+            this.logger.info(
+                `[Route] Switched to eligible account #${this.currentAuthIndex} for model "${routeContext.cleanModelName || "unknown"}".`
+            );
+            return { success: true };
+        } catch (error) {
+            this.logger.error(
+                `[Route] Failed to switch to an eligible account for model "${routeContext.cleanModelName || "unknown"}": ${error.message}`
+            );
+            return {
+                error: {
+                    details: {
+                        localRouteError: true,
+                        reason: "route_switch_unavailable",
+                        statusText: "UNAVAILABLE",
+                    },
+                    message: this._buildRouteSwitchUnavailableMessage(routeContext),
+                    status: 503,
+                },
+                success: false,
+            };
+        }
     }
 
     async _switchToRouteEligibleAuth(routeContext, res, format) {
@@ -294,62 +563,19 @@ class RequestHandler {
             return true;
         }
 
-        const allowedIndices = this._refreshRouteContextAllowedIndices(routeContext);
-        const hasCurrentAvailableAccount =
-            Number.isInteger(this.currentAuthIndex) && this.authSource.availableIndices.includes(this.currentAuthIndex);
-
-        if (!routeContext.isRestrictedModel && hasCurrentAvailableAccount) {
-            return true;
-        }
-
-        if (Number.isInteger(this.currentAuthIndex) && allowedIndices.includes(this.currentAuthIndex)) {
-            return true;
-        }
-
-        if (routeContext.isRestrictedModel && allowedIndices.length === 0) {
-            this._sendInsufficientAccountTierResponse(res, format, routeContext);
+        const candidateResult = await this._ensureCurrentRouteAttemptCandidate(routeContext);
+        if (!candidateResult.success) {
+            this._sendRouteFailureIfNeeded(res, format, routeContext, candidateResult.error);
             return false;
         }
 
-        if (!routeContext.isRestrictedModel && allowedIndices.length === 0) {
-            return true;
-        }
-
-        try {
-            const result = await this.authSwitcher.switchToNextAuth({
-                allowedIndices,
-            });
-            if (result?.success) {
-                this.logger.info(
-                    `[Route] Switched to eligible account #${this.currentAuthIndex} for model "${routeContext.cleanModelName || "unknown"}".`
-                );
-                return true;
-            }
-
-            this._sendApiFormattedErrorResponse(
-                res,
-                format,
-                503,
-                `Service temporarily unavailable: Unable to switch to an eligible account for model "${routeContext.cleanModelName || "unknown"}".`
-            );
-            return false;
-        } catch (error) {
-            this.logger.error(
-                `[Route] Failed to switch to an eligible account for model "${routeContext.cleanModelName || "unknown"}": ${error.message}`
-            );
-            this._sendApiFormattedErrorResponse(
-                res,
-                format,
-                503,
-                `Service temporarily unavailable: Unable to switch to an eligible account for model "${routeContext.cleanModelName || "unknown"}".`
-            );
-            return false;
-        }
+        return true;
     }
 
     async _ensureRouteContextReady(res, format, routeContext, waitOptions = {}) {
-        if (routeContext?.isRestrictedModel && this._refreshRouteContextAllowedIndices(routeContext).length === 0) {
-            this._sendInsufficientAccountTierResponse(res, format, routeContext);
+        const routeError = this._getRouteAvailabilityError(routeContext);
+        if (routeError) {
+            this._sendRouteFailureIfNeeded(res, format, routeContext, routeError);
             return false;
         }
 
@@ -418,20 +644,35 @@ class RequestHandler {
     _categorizeRequest(pathValue, fallback = "request") {
         if (typeof pathValue !== "string") return fallback;
         if (pathValue.includes("countTokens") || pathValue.includes("input_tokens")) return "count_tokens";
-        if (pathValue.includes("generateContent") || pathValue.includes("streamGenerateContent")) return "generation";
+        if (
+            pathValue.includes("generateContent") ||
+            pathValue.includes("streamGenerateContent") ||
+            pathValue.includes(":predict")
+        ) {
+            return "generation";
+        }
         if (pathValue.includes("/upload/")) return "upload";
         return fallback;
     }
 
-    _isGeminiGenerativeRequest(req) {
+    _isGeminiContentGenerationRequest(req) {
         return (
             req.method === "POST" &&
             (req.path.includes("generateContent") || req.path.includes("streamGenerateContent"))
         );
     }
 
+    _isGeminiGenerativeRequest(req) {
+        return (
+            req.method === "POST" &&
+            (req.path.includes("generateContent") ||
+                req.path.includes("streamGenerateContent") ||
+                req.path.includes(":predict"))
+        );
+    }
+
     _validateGeminiNativeRequest(req) {
-        if (!this._isGeminiGenerativeRequest(req)) {
+        if (!this._isGeminiContentGenerationRequest(req)) {
             return null;
         }
 
@@ -469,6 +710,42 @@ class RequestHandler {
         if (this.authSwitcher.shouldSwitchByUsage()) {
             this.needsSwitchingAfterRequest = this._getRouteSwitchOptions(routeContext);
         }
+    }
+
+    _isRecoverableFailoverError(errorPayload, rawError = null) {
+        if (isUserAbortedError(errorPayload) || isUserAbortedError(rawError)) {
+            return false;
+        }
+
+        if (rawError?.reason === "client_disconnect" || errorPayload?.reason === "client_disconnect") {
+            return false;
+        }
+
+        if (this._isConnectionResetError(rawError) || this._isConnectionResetError(errorPayload)) {
+            return true;
+        }
+
+        const status = Number(errorPayload?.status ?? rawError?.status);
+        if (status === 429 || status === 503) {
+            return true;
+        }
+
+        if (isQuotaExhaustedError(errorPayload) || isQuotaExhaustedError(rawError)) {
+            return true;
+        }
+
+        const normalizedText = [errorPayload?.message, errorPayload?.body, errorPayload?.details, rawError?.message]
+            .filter(value => typeof value === "string" && value.trim())
+            .join(" ")
+            .toLowerCase();
+
+        if (!normalizedText) {
+            return false;
+        }
+
+        return ["queue closed", "connection lost", "reconnect", "browser failed", "websocket"].some(keyword =>
+            normalizedText.includes(keyword)
+        );
     }
 
     _isNonRetryableClientError(errorPayload) {
@@ -940,53 +1217,156 @@ class RequestHandler {
         return true;
     }
 
-    _createImmediateSwitchTracker() {
-        const attemptedAuthIndices = new Set();
-        if (Number.isInteger(this.currentAuthIndex) && this.currentAuthIndex >= 0) {
-            attemptedAuthIndices.add(this.currentAuthIndex);
+    async _markCurrentAccountQuotaCooldown(errorPayload = {}) {
+        const currentIndex = this.currentAuthIndex;
+        const cooldownUntil = this._getRouteNextResetAtIso();
+        if (!Number.isInteger(currentIndex) || currentIndex < 0 || !cooldownUntil) {
+            return null;
         }
-        return { attemptedAuthIndices };
+
+        const cooldownReason =
+            typeof errorPayload?.reason === "string" && errorPayload.reason.trim()
+                ? errorPayload.reason
+                : "RESOURCE_EXHAUSTED";
+
+        await this.authSource.markAsCooldown(currentIndex, cooldownUntil, cooldownReason);
+        this.authSwitcher.resetCounters();
+
+        try {
+            await this.browserManager.closeContext(currentIndex);
+        } catch (error) {
+            this.logger.warn(`[Route] Failed to close quota-exhausted account #${currentIndex}: ${error.message}`);
+        }
+
+        this.browserManager.rebalanceContextPool().catch(error => {
+            this.logger.error(`[Route] Background rebalance failed after quota cooldown: ${error.message}`);
+        });
+
+        return cooldownUntil;
     }
 
-    async _performImmediateSwitchRetry(errorDetails, requestId, tracker, routeContext = null) {
-        const switchResult = await this.authSwitcher.handleRequestFailureAndSwitch(
-            { message: errorDetails.message, status: Number(errorDetails.status) },
-            null,
-            this._getRouteSwitchOptions(routeContext)
-        );
-
-        const shouldWaitForReady = switchResult?.success || switchResult?.reason === "Switch already in progress.";
-        if (!shouldWaitForReady) {
-            this.logger.warn(
-                `[Request] Immediate switch for request #${requestId} stopped: ${switchResult?.reason || "switch_failed"}`
-            );
-            return false;
+    async _prepareRouteUpstreamAttempt(proxyRequest, routeContext) {
+        if (!proxyRequest?.is_generative || !routeContext) {
+            return { success: true };
         }
 
-        const ready = await this._waitForSystemAndConnectionIfBusy(null, {
-            sendError: () => {},
+        const candidateResult = await this._ensureCurrentRouteAttemptCandidate(routeContext);
+        if (!candidateResult.success) {
+            return candidateResult;
+        }
+
+        if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
+            return {
+                error: {
+                    details: {
+                        localRouteError: true,
+                        reason: "connection_not_ready",
+                        statusText: "UNAVAILABLE",
+                    },
+                    message: "Service temporarily unavailable: Connection not established for the selected account.",
+                    status: 503,
+                },
+                success: false,
+            };
+        }
+
+        if (routeContext.countsTowardQuota) {
+            const quotaService = this._getAccountQuotaService();
+            if (quotaService) {
+                if (!quotaService.hasRemainingQuota(this.currentAuthIndex, routeContext.quotaCategory)) {
+                    this._refreshRouteContextAllowedIndices(routeContext);
+                    return {
+                        error: this._buildRouteExhaustedErrorPayload(
+                            routeContext,
+                            "all_accounts_temporarily_exhausted"
+                        ),
+                        success: false,
+                    };
+                }
+
+                const consumption = quotaService.consumeQuota(this.currentAuthIndex, routeContext.quotaCategory);
+                this.logger.info(
+                    `[Quota] Consumed ${routeContext.quotaCategory} quota for account #${this.currentAuthIndex}: ${consumption.used}/${Number.isFinite(consumption.limit) ? consumption.limit : "unlimited"}`
+                );
+            }
+        }
+
+        return { success: true };
+    }
+
+    async _performRouteFailover(errorDetails, requestId, routeContext = null, rawError = null) {
+        if (!routeContext || !this._isRecoverableFailoverError(errorDetails, rawError)) {
+            return { success: false };
+        }
+
+        const failedAuthIndex = this.currentAuthIndex;
+        if (Number.isInteger(failedAuthIndex) && failedAuthIndex >= 0) {
+            this._recordRouteFailoverAttempt(routeContext, failedAuthIndex);
+        }
+
+        if (isQuotaExhaustedError(errorDetails) || isQuotaExhaustedError(rawError)) {
+            const cooldownUntil = await this._markCurrentAccountQuotaCooldown(errorDetails);
+            if (cooldownUntil) {
+                this.logger.warn(
+                    `[Route] Upstream quota exhaustion detected for account #${failedAuthIndex}. Cooling down until ${cooldownUntil}.`
+                );
+            }
+        }
+
+        const routeError = this._getRouteFailoverError(routeContext);
+        if (routeError) {
+            this.logger.warn(
+                `[Route] Failover for request #${requestId} stopped: ${routeError.details?.reason || "route_exhausted"}`
+            );
+            return { error: routeError, success: false };
+        }
+
+        const switchOptions = this._getRouteSwitchOptions(routeContext, {
+            applyFailoverLedger: true,
         });
-        if (!ready) {
-            throw new Error("System not ready after immediate-switch retry.");
+
+        if (!switchOptions.allowedIndices.length) {
+            return {
+                error: this._buildRouteExhaustedErrorPayload(routeContext, "all_accounts_failover_exhausted"),
+                success: false,
+            };
         }
 
-        const newAuthIndex = this.currentAuthIndex;
-        if (!Number.isInteger(newAuthIndex) || newAuthIndex < 0) {
-            this.logger.warn(
-                `[Request] Immediate switch for request #${requestId} did not produce a valid target account.`
+        try {
+            const result = await this.authSwitcher.switchToNextAuth(switchOptions);
+            if (!result?.success) {
+                this.logger.warn(
+                    `[Route] Failover switch for request #${requestId} stopped: ${result?.reason || "switch_failed"}`
+                );
+                return { success: false };
+            }
+
+            const ready = await this._waitForSystemAndConnectionIfBusy(null, {
+                sendError: () => {},
+            });
+            if (!ready) {
+                return {
+                    error: {
+                        details: {
+                            localRouteError: true,
+                            reason: "route_switch_unavailable",
+                            statusText: "UNAVAILABLE",
+                        },
+                        message: this._buildRouteSwitchUnavailableMessage(routeContext),
+                        status: 503,
+                    },
+                    success: false,
+                };
+            }
+
+            this.logger.info(
+                `[Route] Recoverable failover for request #${requestId} switched to account #${this.currentAuthIndex}.`
             );
-            return false;
+            return { success: true };
+        } catch (error) {
+            this.logger.error(`[Route] Failover switch for request #${requestId} failed: ${error.message}`);
+            return { success: false };
         }
-
-        if (tracker.attemptedAuthIndices.has(newAuthIndex)) {
-            this.logger.warn(
-                `[Request] Immediate switch for request #${requestId} returned to already-attempted account #${newAuthIndex}, stopping account-switch retries.`
-            );
-            return false;
-        }
-
-        tracker.attemptedAuthIndices.add(newAuthIndex);
-        return true;
     }
 
     _logFinalRequestFailure(errorDetails, contextLabel = "Request") {
@@ -1197,6 +1577,7 @@ class RequestHandler {
     // Process standard Google API requests
     async processRequest(req, res) {
         const requestId = this._generateRequestId();
+        this._ensureDailyQuotaStateSync();
         this._startTrackedRequest(requestId, req, {
             apiFormat: "gemini",
             requestCategory: this._categorizeRequest(req.path, "request"),
@@ -1222,7 +1603,9 @@ class RequestHandler {
             const proxyRequest = this._buildProxyRequest(req, requestId);
             proxyRequest.is_generative = isGenerativeRequest;
             this._initializeProxyRequestAttempt(proxyRequest);
-            const routeContext = this._createRouteContext(this._extractModelFromPath(proxyRequest.path));
+            const routeContext = this._createRouteContext(this._extractModelFromPath(proxyRequest.path), {
+                countsTowardQuota: isGenerativeRequest,
+            });
 
             {
                 const routeReady = await this._ensureRouteContextReady(res, "gemini", routeContext);
@@ -1298,6 +1681,7 @@ class RequestHandler {
     // Process File Upload requests
     async processUploadRequest(req, res) {
         const requestId = this._generateRequestId();
+        this._ensureDailyQuotaStateSync();
         this.logger.info(`[Upload] Processing upload request ${req.method} ${req.path} (ID: ${requestId})`);
         this._startTrackedRequest(requestId, req, {
             apiFormat: "upload",
@@ -1375,6 +1759,7 @@ class RequestHandler {
     // Process OpenAI format requests
     async processOpenAIRequest(req, res) {
         const requestId = this._generateRequestId();
+        this._ensureDailyQuotaStateSync();
         this._startTrackedRequest(requestId, req, {
             apiFormat: "openai",
             isStreaming: req.body.stream === true,
@@ -1404,7 +1789,9 @@ class RequestHandler {
                 return this._sendErrorResponse(res, 400, "Invalid OpenAI request format.");
             }
 
-            const routeContext = this._createRouteContext(model);
+            const routeContext = this._createRouteContext(model, {
+                countsTowardQuota: true,
+            });
 
             {
                 const routeReady = await this._ensureRouteContextReady(res, "openai", routeContext);
@@ -1451,10 +1838,33 @@ class RequestHandler {
                     let currentQueue = messageQueue;
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
-                    const immediateSwitchTracker = this._createImmediateSwitchTracker();
 
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
+                        const prepareResult = await this._prepareRouteUpstreamAttempt(proxyRequest, routeContext);
+                        if (!prepareResult.success) {
+                            initialMessage = {
+                                event_type: "error",
+                                ...prepareResult.error,
+                                skipAccountSwitch: true,
+                            };
+                            skipFinalFailureSwitch = true;
+                            break;
+                        }
+
+                        if (this.currentAuthIndex !== this.connectionRegistry.getAuthIndexForRequest(requestId)) {
+                            try {
+                                currentQueue.close("queue_rebound_after_preflight_switch");
+                            } catch {
+                                /* empty */
+                            }
+                            currentQueue = this.connectionRegistry.createMessageQueue(
+                                requestId,
+                                this.currentAuthIndex,
+                                proxyRequest.request_attempt_id
+                            );
+                        }
+
                         this._getUsageStatsService()?.recordAttempt(
                             proxyRequest.request_id,
                             this.currentAuthIndex,
@@ -1463,39 +1873,42 @@ class RequestHandler {
                         this._forwardRequest(proxyRequest);
                         initialMessage = await currentQueue.dequeue();
 
-                        const initialStatus = Number(initialMessage?.status);
                         if (
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
-                            Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            this._isRecoverableFailoverError(initialMessage, initialMessage)
                         ) {
-                            this.logger.warn(
-                                `[Request] OpenAI real stream received ${initialStatus}, switching account and retrying...`
-                            );
-                            const switched = await this._performImmediateSwitchRetry(
+                            const failoverResult = await this._performRouteFailover(
                                 initialMessage,
                                 requestId,
-                                immediateSwitchTracker,
-                                routeContext
+                                routeContext,
+                                initialMessage
                             );
-                            if (!switched) {
-                                skipFinalFailureSwitch = true;
-                                break;
+                            if (failoverResult.success) {
+                                try {
+                                    currentQueue.close("retry_after_failover");
+                                } catch {
+                                    /* empty */
+                                }
+                                this._advanceProxyRequestAttempt(proxyRequest);
+                                currentQueue = this.connectionRegistry.createMessageQueue(
+                                    requestId,
+                                    this.currentAuthIndex,
+                                    proxyRequest.request_attempt_id
+                                );
+                                continue;
                             }
 
-                            try {
-                                currentQueue.close("retry_after_429");
-                            } catch {
-                                /* empty */
+                            if (failoverResult.error) {
+                                initialMessage = {
+                                    event_type: "error",
+                                    ...failoverResult.error,
+                                    skipAccountSwitch: true,
+                                };
+                                skipFinalFailureSwitch = true;
                             }
-                            this._advanceProxyRequestAttempt(proxyRequest);
-                            currentQueue = this.connectionRegistry.createMessageQueue(
-                                requestId,
-                                this.currentAuthIndex,
-                                proxyRequest.request_attempt_id
-                            );
-                            continue;
+
+                            break;
                         }
 
                         break;
@@ -1504,19 +1917,25 @@ class RequestHandler {
                     if (initialMessage.event_type === "error") {
                         this._logFinalRequestFailure(initialMessage, "OpenAI real stream");
 
-                        // Send standard HTTP error response
-                        this._sendErrorResponse(res, initialMessage.status || 500, initialMessage.message);
+                        if (initialMessage.localRouteError || initialMessage.details?.localRouteError) {
+                            this._sendRouteErrorResponse(res, "openai", initialMessage);
+                        } else {
+                            this._sendErrorResponse(res, initialMessage.status || 500, initialMessage.message);
+                        }
 
-                        // Avoid switching account if the error is just a connection reset
-                        if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
+                        if (
+                            !skipFinalFailureSwitch &&
+                            !initialMessage.skipAccountSwitch &&
+                            !this._isConnectionResetError(initialMessage)
+                        ) {
                             await this.authSwitcher.handleRequestFailureAndSwitch(
                                 initialMessage,
                                 null,
                                 this._getRouteSwitchOptions(routeContext)
                             );
-                        } else if (skipFinalFailureSwitch) {
+                        } else if (skipFinalFailureSwitch || initialMessage.skipAccountSwitch) {
                             this.logger.info(
-                                "[Request] Immediate-switch retries exhausted, skipping additional account switch."
+                                "[Request] Route failover exhausted or handled locally, skipping additional account switch."
                             );
                         } else {
                             this.logger.info(
@@ -1569,17 +1988,25 @@ class RequestHandler {
 
                         if (!result.success) {
                             this._logFinalRequestFailure(result.error, "OpenAI fake/non-stream");
-                            // Send standard HTTP error response for both streaming and non-streaming
                             if (connectionMaintainer) clearTimeout(connectionMaintainer);
-                            if (isOpenAIStream && res.headersSent) {
-                                // If keep-alives already started the SSE response, send an SSE error event instead of JSON.
+                            if (result.error?.localRouteError || result.error?.details?.localRouteError) {
+                                if (res.headersSent) {
+                                    this._handleRequestError(result.error, res, "openai");
+                                } else {
+                                    this._sendRouteErrorResponse(res, "openai", result.error);
+                                }
+                            } else if (isOpenAIStream && res.headersSent) {
                                 this._handleRequestError(result.error, res, "openai");
                             } else {
                                 this._sendErrorResponse(res, result.error.status || 500, result.error.message);
                             }
 
-                            // Avoid switching account if the error is just a connection reset
-                            if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
+                            if (
+                                !result.error.skipAccountSwitch &&
+                                !this._isConnectionResetError(result.error) &&
+                                !result.error.localRouteError &&
+                                !result.error.details?.localRouteError
+                            ) {
                                 await this.authSwitcher.handleRequestFailureAndSwitch(
                                     result.error,
                                     null,
@@ -1587,7 +2014,7 @@ class RequestHandler {
                                 );
                             } else if (result.error.skipAccountSwitch) {
                                 this.logger.info(
-                                    "[Request] Immediate-switch retries exhausted, skipping additional account switch."
+                                    "[Request] Route failover exhausted or handled locally, skipping additional account switch."
                                 );
                             } else {
                                 this.logger.info(
@@ -1720,6 +2147,7 @@ class RequestHandler {
     // Process OpenAI Response API format requests
     async processOpenAIResponseRequest(req, res) {
         const requestId = this._generateRequestId();
+        this._ensureDailyQuotaStateSync();
         this._startTrackedRequest(requestId, req, {
             apiFormat: "response_api",
             isStreaming: req.body.stream === true,
@@ -1798,7 +2226,9 @@ class RequestHandler {
                 return this._sendErrorResponse(res, 400, "Invalid OpenAI Response request format.");
             }
 
-            const routeContext = this._createRouteContext(model);
+            const routeContext = this._createRouteContext(model, {
+                countsTowardQuota: true,
+            });
 
             {
                 const routeReady = await this._ensureRouteContextReady(res, "response_api", routeContext);
@@ -1846,10 +2276,33 @@ class RequestHandler {
                     let currentQueue = messageQueue;
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
-                    const immediateSwitchTracker = this._createImmediateSwitchTracker();
 
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
+                        const prepareResult = await this._prepareRouteUpstreamAttempt(proxyRequest, routeContext);
+                        if (!prepareResult.success) {
+                            initialMessage = {
+                                event_type: "error",
+                                ...prepareResult.error,
+                                skipAccountSwitch: true,
+                            };
+                            skipFinalFailureSwitch = true;
+                            break;
+                        }
+
+                        if (this.currentAuthIndex !== this.connectionRegistry.getAuthIndexForRequest(requestId)) {
+                            try {
+                                currentQueue.close("queue_rebound_after_preflight_switch");
+                            } catch {
+                                /* empty */
+                            }
+                            currentQueue = this.connectionRegistry.createMessageQueue(
+                                requestId,
+                                this.currentAuthIndex,
+                                proxyRequest.request_attempt_id
+                            );
+                        }
+
                         this._getUsageStatsService()?.recordAttempt(
                             proxyRequest.request_id,
                             this.currentAuthIndex,
@@ -1858,39 +2311,42 @@ class RequestHandler {
                         this._forwardRequest(proxyRequest);
                         initialMessage = await currentQueue.dequeue();
 
-                        const initialStatus = Number(initialMessage?.status);
                         if (
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
-                            Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            this._isRecoverableFailoverError(initialMessage, initialMessage)
                         ) {
-                            this.logger.warn(
-                                `[Request] OpenAI Response API real stream received ${initialStatus}, switching account and retrying...`
-                            );
-                            const switched = await this._performImmediateSwitchRetry(
+                            const failoverResult = await this._performRouteFailover(
                                 initialMessage,
                                 requestId,
-                                immediateSwitchTracker,
-                                routeContext
+                                routeContext,
+                                initialMessage
                             );
-                            if (!switched) {
-                                skipFinalFailureSwitch = true;
-                                break;
+                            if (failoverResult.success) {
+                                try {
+                                    currentQueue.close("retry_after_failover");
+                                } catch {
+                                    /* empty */
+                                }
+                                this._advanceProxyRequestAttempt(proxyRequest);
+                                currentQueue = this.connectionRegistry.createMessageQueue(
+                                    requestId,
+                                    this.currentAuthIndex,
+                                    proxyRequest.request_attempt_id
+                                );
+                                continue;
                             }
 
-                            try {
-                                currentQueue.close("retry_after_429");
-                            } catch {
-                                /* empty */
+                            if (failoverResult.error) {
+                                initialMessage = {
+                                    event_type: "error",
+                                    ...failoverResult.error,
+                                    skipAccountSwitch: true,
+                                };
+                                skipFinalFailureSwitch = true;
                             }
-                            this._advanceProxyRequestAttempt(proxyRequest);
-                            currentQueue = this.connectionRegistry.createMessageQueue(
-                                requestId,
-                                this.currentAuthIndex,
-                                proxyRequest.request_attempt_id
-                            );
-                            continue;
+
+                            break;
                         }
 
                         break;
@@ -1899,19 +2355,25 @@ class RequestHandler {
                     if (initialMessage.event_type === "error") {
                         this._logFinalRequestFailure(initialMessage, "OpenAI Response API real stream");
 
-                        // Send standard HTTP error response
-                        this._sendErrorResponse(res, initialMessage.status || 500, initialMessage.message);
+                        if (initialMessage.localRouteError || initialMessage.details?.localRouteError) {
+                            this._sendRouteErrorResponse(res, "response_api", initialMessage);
+                        } else {
+                            this._sendErrorResponse(res, initialMessage.status || 500, initialMessage.message);
+                        }
 
-                        // Avoid switching account if the error is just a connection reset
-                        if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
+                        if (
+                            !skipFinalFailureSwitch &&
+                            !initialMessage.skipAccountSwitch &&
+                            !this._isConnectionResetError(initialMessage)
+                        ) {
                             await this.authSwitcher.handleRequestFailureAndSwitch(
                                 initialMessage,
                                 null,
                                 this._getRouteSwitchOptions(routeContext)
                             );
-                        } else if (skipFinalFailureSwitch) {
+                        } else if (skipFinalFailureSwitch || initialMessage.skipAccountSwitch) {
                             this.logger.info(
-                                "[Request] Immediate-switch retries exhausted, skipping additional account switch."
+                                "[Request] Route failover exhausted or handled locally, skipping additional account switch."
                             );
                         } else {
                             this.logger.info(
@@ -1966,17 +2428,25 @@ class RequestHandler {
 
                         if (!result.success) {
                             this._logFinalRequestFailure(result.error, "OpenAI Response API fake/non-stream");
-                            // Send standard HTTP error response for both streaming and non-streaming
                             if (connectionMaintainer) clearTimeout(connectionMaintainer);
-                            if (isOpenAIStream && res.headersSent) {
-                                // If keep-alives already started the SSE response, send an SSE error event instead of JSON.
+                            if (result.error?.localRouteError || result.error?.details?.localRouteError) {
+                                if (res.headersSent) {
+                                    this._handleRequestError(result.error, res, "response_api");
+                                } else {
+                                    this._sendRouteErrorResponse(res, "response_api", result.error);
+                                }
+                            } else if (isOpenAIStream && res.headersSent) {
                                 this._handleRequestError(result.error, res, "response_api");
                             } else {
                                 this._sendErrorResponse(res, result.error.status || 500, result.error.message);
                             }
 
-                            // Avoid switching account if the error is just a connection reset
-                            if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
+                            if (
+                                !result.error.skipAccountSwitch &&
+                                !this._isConnectionResetError(result.error) &&
+                                !result.error.localRouteError &&
+                                !result.error.details?.localRouteError
+                            ) {
                                 await this.authSwitcher.handleRequestFailureAndSwitch(
                                     result.error,
                                     null,
@@ -1984,7 +2454,7 @@ class RequestHandler {
                                 );
                             } else if (result.error.skipAccountSwitch) {
                                 this.logger.info(
-                                    "[Request] Immediate-switch retries exhausted, skipping additional account switch."
+                                    "[Request] Route failover exhausted or handled locally, skipping additional account switch."
                                 );
                             } else {
                                 this.logger.info(
@@ -2132,6 +2602,7 @@ class RequestHandler {
     // Process Claude API format requests
     async processClaudeRequest(req, res) {
         const requestId = this._generateRequestId();
+        this._ensureDailyQuotaStateSync();
         this._startTrackedRequest(requestId, req, {
             apiFormat: "claude",
             isStreaming: req.body.stream === true,
@@ -2166,7 +2637,9 @@ class RequestHandler {
                 );
             }
 
-            const routeContext = this._createRouteContext(model);
+            const routeContext = this._createRouteContext(model, {
+                countsTowardQuota: true,
+            });
 
             {
                 const routeReady = await this._ensureRouteContextReady(res, "claude", routeContext, {
@@ -2217,10 +2690,33 @@ class RequestHandler {
                     let currentQueue = messageQueue;
                     let initialMessage;
                     let skipFinalFailureSwitch = false;
-                    const immediateSwitchTracker = this._createImmediateSwitchTracker();
 
                     // eslint-disable-next-line no-constant-condition
                     while (true) {
+                        const prepareResult = await this._prepareRouteUpstreamAttempt(proxyRequest, routeContext);
+                        if (!prepareResult.success) {
+                            initialMessage = {
+                                event_type: "error",
+                                ...prepareResult.error,
+                                skipAccountSwitch: true,
+                            };
+                            skipFinalFailureSwitch = true;
+                            break;
+                        }
+
+                        if (this.currentAuthIndex !== this.connectionRegistry.getAuthIndexForRequest(requestId)) {
+                            try {
+                                currentQueue.close("queue_rebound_after_preflight_switch");
+                            } catch {
+                                /* empty */
+                            }
+                            currentQueue = this.connectionRegistry.createMessageQueue(
+                                requestId,
+                                this.currentAuthIndex,
+                                proxyRequest.request_attempt_id
+                            );
+                        }
+
                         this._getUsageStatsService()?.recordAttempt(
                             proxyRequest.request_id,
                             this.currentAuthIndex,
@@ -2229,39 +2725,42 @@ class RequestHandler {
                         this._forwardRequest(proxyRequest);
                         initialMessage = await currentQueue.dequeue();
 
-                        const initialStatus = Number(initialMessage?.status);
                         if (
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
-                            Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            this._isRecoverableFailoverError(initialMessage, initialMessage)
                         ) {
-                            this.logger.warn(
-                                `[Request] Claude real stream received ${initialStatus}, switching account and retrying...`
-                            );
-                            const switched = await this._performImmediateSwitchRetry(
+                            const failoverResult = await this._performRouteFailover(
                                 initialMessage,
                                 requestId,
-                                immediateSwitchTracker,
-                                routeContext
+                                routeContext,
+                                initialMessage
                             );
-                            if (!switched) {
-                                skipFinalFailureSwitch = true;
-                                break;
+                            if (failoverResult.success) {
+                                try {
+                                    currentQueue.close("retry_after_failover");
+                                } catch {
+                                    /* empty */
+                                }
+                                this._advanceProxyRequestAttempt(proxyRequest);
+                                currentQueue = this.connectionRegistry.createMessageQueue(
+                                    requestId,
+                                    this.currentAuthIndex,
+                                    proxyRequest.request_attempt_id
+                                );
+                                continue;
                             }
 
-                            try {
-                                currentQueue.close("retry_after_429");
-                            } catch {
-                                /* empty */
+                            if (failoverResult.error) {
+                                initialMessage = {
+                                    event_type: "error",
+                                    ...failoverResult.error,
+                                    skipAccountSwitch: true,
+                                };
+                                skipFinalFailureSwitch = true;
                             }
-                            this._advanceProxyRequestAttempt(proxyRequest);
-                            currentQueue = this.connectionRegistry.createMessageQueue(
-                                requestId,
-                                this.currentAuthIndex,
-                                proxyRequest.request_attempt_id
-                            );
-                            continue;
+
+                            break;
                         }
 
                         break;
@@ -2269,21 +2768,29 @@ class RequestHandler {
 
                     if (initialMessage.event_type === "error") {
                         this._logFinalRequestFailure(initialMessage, "Claude real stream");
-                        this._sendClaudeErrorResponse(
-                            res,
-                            initialMessage.status || 500,
-                            "api_error",
-                            initialMessage.message
-                        );
-                        if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
+                        if (initialMessage.localRouteError || initialMessage.details?.localRouteError) {
+                            this._sendRouteErrorResponse(res, "claude", initialMessage);
+                        } else {
+                            this._sendClaudeErrorResponse(
+                                res,
+                                initialMessage.status || 500,
+                                "api_error",
+                                initialMessage.message
+                            );
+                        }
+                        if (
+                            !skipFinalFailureSwitch &&
+                            !initialMessage.skipAccountSwitch &&
+                            !this._isConnectionResetError(initialMessage)
+                        ) {
                             await this.authSwitcher.handleRequestFailureAndSwitch(
                                 initialMessage,
                                 null,
                                 this._getRouteSwitchOptions(routeContext)
                             );
-                        } else if (skipFinalFailureSwitch) {
+                        } else if (skipFinalFailureSwitch || initialMessage.skipAccountSwitch) {
                             this.logger.info(
-                                "[Request] Immediate-switch retries exhausted, skipping additional account switch."
+                                "[Request] Route failover exhausted or handled locally, skipping additional account switch."
                             );
                         }
                         return;
@@ -2330,8 +2837,13 @@ class RequestHandler {
                         if (!result.success) {
                             this._logFinalRequestFailure(result.error, "Claude fake/non-stream");
                             if (connectionMaintainer) clearTimeout(connectionMaintainer);
-                            if (isClaudeStream && res.headersSent) {
-                                // If keep-alives already started the SSE response, send an SSE error event instead of JSON.
+                            if (result.error?.localRouteError || result.error?.details?.localRouteError) {
+                                if (res.headersSent) {
+                                    this._handleClaudeRequestError(result.error, res);
+                                } else {
+                                    this._sendRouteErrorResponse(res, "claude", result.error);
+                                }
+                            } else if (isClaudeStream && res.headersSent) {
                                 this._handleClaudeRequestError(result.error, res);
                             } else {
                                 this._sendClaudeErrorResponse(
@@ -2341,7 +2853,12 @@ class RequestHandler {
                                     result.error.message
                                 );
                             }
-                            if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
+                            if (
+                                !result.error.skipAccountSwitch &&
+                                !this._isConnectionResetError(result.error) &&
+                                !result.error.localRouteError &&
+                                !result.error.details?.localRouteError
+                            ) {
                                 await this.authSwitcher.handleRequestFailureAndSwitch(
                                     result.error,
                                     null,
@@ -2349,7 +2866,7 @@ class RequestHandler {
                                 );
                             } else if (result.error.skipAccountSwitch) {
                                 this.logger.info(
-                                    "[Request] Immediate-switch retries exhausted, skipping additional account switch."
+                                    "[Request] Route failover exhausted or handled locally, skipping additional account switch."
                                 );
                             }
                             return;
@@ -2480,6 +2997,7 @@ class RequestHandler {
     // Process Claude count tokens request
     async processClaudeCountTokens(req, res) {
         const requestId = this._generateRequestId();
+        this._ensureDailyQuotaStateSync();
         this._startTrackedRequest(requestId, req, {
             apiFormat: "claude",
             isStreaming: false,
@@ -2510,7 +3028,9 @@ class RequestHandler {
                 );
             }
 
-            const routeContext = this._createRouteContext(model);
+            const routeContext = this._createRouteContext(model, {
+                countsTowardQuota: false,
+            });
 
             {
                 const routeReady = await this._ensureRouteContextReady(res, "claude", routeContext, {
@@ -2634,6 +3154,7 @@ class RequestHandler {
     // Mirrors OpenAI's /v1/responses/input_tokens by returning only the request-side token count.
     async processOpenAIResponseInputTokens(req, res) {
         const requestId = this._generateRequestId();
+        this._ensureDailyQuotaStateSync();
         this._startTrackedRequest(requestId, req, {
             apiFormat: "response_api",
             isStreaming: false,
@@ -2659,7 +3180,9 @@ class RequestHandler {
                 return this._sendErrorResponse(res, 400, "Invalid OpenAI Response request format.");
             }
 
-            const routeContext = this._createRouteContext(model);
+            const routeContext = this._createRouteContext(model, {
+                countsTowardQuota: false,
+            });
 
             {
                 const routeReady = await this._ensureRouteContextReady(res, "response_api", routeContext);
@@ -2951,9 +3474,8 @@ class RequestHandler {
                     try {
                         let errorType = "api_error";
                         let errorMessage = `Processing failed: ${errorMsg}`;
-                        let errorStatus = 500;
+                        let errorStatus = Number.isFinite(Number(error?.status)) ? Number(error.status) : 500;
 
-                        // Use precise error type checking instead of string matching
                         if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
                             errorType = "timeout_error";
                             errorMessage = `Stream timeout: ${errorMsg}`;
@@ -2962,6 +3484,9 @@ class RequestHandler {
                             errorType = "overloaded_error";
                             errorMessage = `Service unavailable: ${errorMsg}`;
                             errorStatus = 503;
+                        } else if (errorStatus === 429) {
+                            errorType = "overloaded_error";
+                            errorMessage = errorMsg;
                         }
 
                         this._markTrackedResponseError(res, errorMessage, errorStatus);
@@ -2985,9 +3510,8 @@ class RequestHandler {
             if (!res.writableEnded) res.end();
         } else {
             this.logger.error(`[Request] Claude request error: ${errorMsg}`);
-            let status = 500;
+            let status = Number.isFinite(Number(error?.status)) ? Number(error.status) : 500;
             let errorType = "api_error";
-            // Use precise error type checking instead of string matching
             if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
                 status = 504;
                 errorType = "timeout_error";
@@ -2995,8 +3519,15 @@ class RequestHandler {
                 status = 503;
                 errorType = "overloaded_error";
                 this.logger.info(`[Request] Queue closed, returning 503 Service Unavailable.`);
+            } else if (status === 429) {
+                errorType = "overloaded_error";
             }
-            this._sendClaudeErrorResponse(res, status, errorType, `Proxy error: ${errorMsg}`);
+            this._sendClaudeErrorResponse(
+                res,
+                status,
+                errorType,
+                error?.localRouteError || error?.details?.localRouteError ? errorMsg : `Proxy error: ${errorMsg}`
+            );
         }
     }
 
@@ -3038,15 +3569,24 @@ class RequestHandler {
                     );
                 } else {
                     this._logFinalRequestFailure(result.error, "Gemini fake stream");
-                    // If keep-alives already started the SSE response, send an SSE error event instead of JSON.
-                    if (res.headersSent) {
+                    if (result.error?.localRouteError || result.error?.details?.localRouteError) {
+                        if (res.headersSent) {
+                            this._handleRequestError(result.error, res, "gemini");
+                        } else {
+                            this._sendRouteErrorResponse(res, "gemini", result.error);
+                        }
+                    } else if (res.headersSent) {
                         this._handleRequestError(result.error, res, "gemini");
                     } else {
                         this._sendErrorResponse(res, result.error.status || 500, result.error.message);
                     }
 
-                    // Avoid switching account if the error is just a connection reset
-                    if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
+                    if (
+                        !result.error.skipAccountSwitch &&
+                        !this._isConnectionResetError(result.error) &&
+                        !result.error.localRouteError &&
+                        !result.error.details?.localRouteError
+                    ) {
                         await this.authSwitcher.handleRequestFailureAndSwitch(
                             result.error,
                             null,
@@ -3054,7 +3594,7 @@ class RequestHandler {
                         );
                     } else if (result.error.skipAccountSwitch) {
                         this.logger.info(
-                            "[Request] Immediate-switch retries exhausted, skipping additional account switch."
+                            "[Request] Route failover exhausted or handled locally, skipping additional account switch."
                         );
                     } else {
                         this.logger.info(
@@ -3294,11 +3834,33 @@ class RequestHandler {
         let currentQueue = messageQueue;
         let headerMessage;
         let skipFinalFailureSwitch = false;
-        const immediateSwitchTracker = this._createImmediateSwitchTracker();
 
         // eslint-disable-next-line no-constant-condition
         while (true) {
-            // Record attempt before forwarding, so failed attempts are also counted
+            const prepareResult = await this._prepareRouteUpstreamAttempt(proxyRequest, routeContext);
+            if (!prepareResult.success) {
+                headerMessage = {
+                    event_type: "error",
+                    ...prepareResult.error,
+                    skipAccountSwitch: true,
+                };
+                skipFinalFailureSwitch = true;
+                break;
+            }
+
+            if (this.currentAuthIndex !== this.connectionRegistry.getAuthIndexForRequest(proxyRequest.request_id)) {
+                try {
+                    currentQueue.close("queue_rebound_after_preflight_switch");
+                } catch {
+                    /* empty */
+                }
+                currentQueue = this.connectionRegistry.createMessageQueue(
+                    proxyRequest.request_id,
+                    this.currentAuthIndex,
+                    proxyRequest.request_attempt_id
+                );
+            }
+
             this._getUsageStatsService()?.recordAttempt(
                 proxyRequest.request_id,
                 this.currentAuthIndex,
@@ -3307,41 +3869,44 @@ class RequestHandler {
             this._forwardRequest(proxyRequest);
             headerMessage = await currentQueue.dequeue();
 
-            const headerStatus = Number(headerMessage?.status);
             if (
                 headerMessage.event_type === "error" &&
                 proxyRequest.is_generative &&
                 !isUserAbortedError(headerMessage) &&
-                Number.isFinite(headerStatus) &&
-                this.config?.immediateSwitchStatusCodes?.includes(headerStatus)
+                this._isRecoverableFailoverError(headerMessage, headerMessage)
             ) {
-                this.logger.warn(
-                    `[Request] Gemini real stream received ${headerStatus}, switching account and retrying...`
-                );
-                const switched = await this._performImmediateSwitchRetry(
+                const failoverResult = await this._performRouteFailover(
                     headerMessage,
                     proxyRequest.request_id,
-                    immediateSwitchTracker,
-                    routeContext
+                    routeContext,
+                    headerMessage
                 );
-                if (!switched) {
+                if (failoverResult.success) {
+                    try {
+                        currentQueue.close("retry_after_failover");
+                    } catch {
+                        /* empty */
+                    }
+
+                    this._advanceProxyRequestAttempt(proxyRequest);
+                    currentQueue = this.connectionRegistry.createMessageQueue(
+                        proxyRequest.request_id,
+                        this.currentAuthIndex,
+                        proxyRequest.request_attempt_id
+                    );
+                    continue;
+                }
+
+                if (failoverResult.error) {
+                    headerMessage = {
+                        event_type: "error",
+                        ...failoverResult.error,
+                        skipAccountSwitch: true,
+                    };
                     skipFinalFailureSwitch = true;
-                    break;
                 }
 
-                try {
-                    currentQueue.close("retry_after_429");
-                } catch {
-                    /* empty */
-                }
-
-                this._advanceProxyRequestAttempt(proxyRequest);
-                currentQueue = this.connectionRegistry.createMessageQueue(
-                    proxyRequest.request_id,
-                    this.currentAuthIndex,
-                    proxyRequest.request_attempt_id
-                );
-                continue;
+                break;
             }
 
             break;
@@ -3354,21 +3919,28 @@ class RequestHandler {
                 );
             } else {
                 this._logFinalRequestFailure(headerMessage, "Gemini real stream");
-                // Avoid switching account if the error is just a connection reset
-                if (!skipFinalFailureSwitch && !this._isConnectionResetError(headerMessage)) {
+                if (
+                    !skipFinalFailureSwitch &&
+                    !headerMessage.skipAccountSwitch &&
+                    !this._isConnectionResetError(headerMessage)
+                ) {
                     await this.authSwitcher.handleRequestFailureAndSwitch(
                         headerMessage,
                         null,
                         this._getRouteSwitchOptions(routeContext)
                     );
-                } else if (skipFinalFailureSwitch) {
+                } else if (skipFinalFailureSwitch || headerMessage.skipAccountSwitch) {
                     this.logger.info(
-                        "[Request] Immediate-switch retries exhausted, skipping additional account switch."
+                        "[Request] Route failover exhausted or handled locally, skipping additional account switch."
                     );
                 } else {
                     this.logger.info(
                         "[Request] Failure due to connection reset (Gemini Real Stream), skipping account switch."
                     );
+                }
+                if (headerMessage.localRouteError || headerMessage.details?.localRouteError) {
+                    this._sendRouteErrorResponse(res, "gemini", headerMessage);
+                    return;
                 }
                 return this._sendErrorResponse(res, headerMessage.status, headerMessage.message);
             }
@@ -3481,8 +4053,12 @@ class RequestHandler {
                     this.logger.info(`[Request] Request #${proxyRequest.request_id} was properly cancelled by user.`);
                 } else {
                     this._logFinalRequestFailure(result.error, "Gemini non-stream");
-                    // Avoid switching account if the error is just a connection reset
-                    if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
+                    if (
+                        !result.error.skipAccountSwitch &&
+                        !this._isConnectionResetError(result.error) &&
+                        !result.error.localRouteError &&
+                        !result.error.details?.localRouteError
+                    ) {
                         await this.authSwitcher.handleRequestFailureAndSwitch(
                             result.error,
                             null,
@@ -3490,13 +4066,21 @@ class RequestHandler {
                         );
                     } else if (result.error.skipAccountSwitch) {
                         this.logger.info(
-                            "[Request] Immediate-switch retries exhausted, skipping additional account switch."
+                            "[Request] Route failover exhausted or handled locally, skipping additional account switch."
                         );
                     } else {
                         this.logger.info(
                             "[Request] Failure due to connection reset (Gemini Non-Stream), skipping account switch."
                         );
                     }
+                }
+                if (result.error?.localRouteError || result.error?.details?.localRouteError) {
+                    if (res.headersSent) {
+                        this._handleRequestError(result.error, res, "gemini");
+                    } else {
+                        this._sendRouteErrorResponse(res, "gemini", result.error);
+                    }
+                    return;
                 }
                 return this._sendErrorResponse(res, result.error.status || 500, result.error.message);
             }
@@ -3602,19 +4186,37 @@ class RequestHandler {
     async _executeRequestWithRetries(proxyRequest, messageQueue, routeContext = null) {
         let lastError = null;
         let currentQueue = messageQueue;
-        // Track the authIndex for the current queue to ensure proper cleanup
         let currentQueueAuthIndex = this.currentAuthIndex;
         let retryAttempt = 1;
-        const immediateSwitchTracker = this._createImmediateSwitchTracker();
 
         while (retryAttempt <= this.maxRetries) {
-            // Record attempt at the start of each retry, before forwarding.
-            // This ensures failed attempts (e.g. 429 before any response) are also counted.
+            const prepareResult = await this._prepareRouteUpstreamAttempt(proxyRequest, routeContext);
+            if (!prepareResult.success) {
+                lastError = { ...prepareResult.error, skipAccountSwitch: true };
+                break;
+            }
+
+            if (currentQueueAuthIndex !== this.currentAuthIndex) {
+                try {
+                    currentQueue.close("queue_rebound_after_preflight_switch");
+                } catch (e) {
+                    this.logger.debug(`[Request] Failed to close old queue before switch rebound: ${e.message}`);
+                }
+                currentQueue = this.connectionRegistry.createMessageQueue(
+                    proxyRequest.request_id,
+                    this.currentAuthIndex,
+                    proxyRequest.request_attempt_id
+                );
+                currentQueueAuthIndex = this.currentAuthIndex;
+            }
+
+            currentQueueAuthIndex = this.currentAuthIndex;
             this._getUsageStatsService()?.recordAttempt(
                 proxyRequest.request_id,
                 this.currentAuthIndex,
                 this._getAccountNameForIndex(this.currentAuthIndex)
             );
+
             try {
                 this._forwardRequest(proxyRequest);
 
@@ -3643,7 +4245,6 @@ class RequestHandler {
                 try {
                     errorPayload = JSON.parse(error.message);
                 } catch (e) {
-                    // JSON parse failed - check if it's a timeout error
                     if (error.code === "QUEUE_TIMEOUT" || error instanceof QueueTimeoutError) {
                         errorPayload = { message: error.message || "Queue timeout", status: 504 };
                     } else {
@@ -3651,9 +4252,7 @@ class RequestHandler {
                     }
                 }
 
-                // Stop retrying immediately if the queue is closed
                 if (this._isConnectionResetError(error)) {
-                    // Check the actual closure reason to provide accurate error messages
                     const reason = error.reason || "unknown";
                     const isClientDisconnect = reason === "client_disconnect";
 
@@ -3669,7 +4268,6 @@ class RequestHandler {
                             status: 503,
                         };
                     }
-                    break;
                 }
 
                 lastError = errorPayload;
@@ -3683,31 +4281,13 @@ class RequestHandler {
                     break;
                 }
 
-                // Check if we should stop retrying immediately based on status code
-                if (
-                    Number.isFinite(errorStatus) &&
-                    this.config?.immediateSwitchStatusCodes?.includes(errorStatus) &&
-                    !isUserAbortedError(errorPayload)
-                ) {
-                    this.logger.warn(`[Request] Received ${errorStatus}, switching account and retrying...`);
-                    try {
-                        const switched = await this._performImmediateSwitchRetry(
-                            errorPayload,
-                            proxyRequest.request_id,
-                            immediateSwitchTracker,
-                            routeContext
-                        );
-                        if (!switched) {
-                            lastError = { ...errorPayload, skipAccountSwitch: true };
-                            break;
-                        }
-                    } catch (switchError) {
-                        lastError = { ...errorPayload, skipAccountSwitch: true };
-                        this.logger.error(
-                            `[Request] Account switch failed during immediate-switch retry flow: ${switchError.message}`
-                        );
-                        break;
-                    }
+                const failoverResult = await this._performRouteFailover(
+                    errorPayload,
+                    proxyRequest.request_id,
+                    routeContext,
+                    error
+                );
+                if (failoverResult.success) {
                     try {
                         currentQueue.close("retry_creating_new_queue");
                     } catch (e) {
@@ -3715,7 +4295,7 @@ class RequestHandler {
                     }
 
                     this.logger.debug(
-                        `[Request] Creating new message queue after immediate switch for request #${proxyRequest.request_id} (switching from account #${currentQueueAuthIndex} to #${this.currentAuthIndex})`
+                        `[Request] Creating new message queue after failover for request #${proxyRequest.request_id} (switching from account #${currentQueueAuthIndex} to #${this.currentAuthIndex})`
                     );
                     this._advanceProxyRequestAttempt(proxyRequest);
                     currentQueue = this.connectionRegistry.createMessageQueue(
@@ -3726,13 +4306,20 @@ class RequestHandler {
                     currentQueueAuthIndex = this.currentAuthIndex;
                     continue;
                 }
+                if (failoverResult.error) {
+                    lastError = { ...failoverResult.error, skipAccountSwitch: true };
+                    break;
+                }
 
-                // Log the warning for the current attempt
+                if (this._isRecoverableFailoverError(errorPayload, error)) {
+                    lastError = { ...errorPayload, skipAccountSwitch: true };
+                    break;
+                }
+
                 this.logger.warn(
                     `[Request] Attempt #${retryAttempt}/${this.maxRetries} for request #${proxyRequest.request_id} failed: ${errorPayload.message}`
                 );
 
-                // If it's the last attempt, break the loop to return failure
                 if (retryAttempt >= this.maxRetries) {
                     this.logger.error(
                         `[Request] All ${this.maxRetries} retries failed for request #${proxyRequest.request_id}. Final error: ${errorPayload.message}`
@@ -3740,26 +4327,18 @@ class RequestHandler {
                     break;
                 }
 
-                // Cancel browser request on the ORIGINAL account that owns this queue.
-                // request_attempt_id isolates retries so a delayed cancel cannot abort a newer attempt.
-                // If account has switched, currentAuthIndex may differ from currentQueueAuthIndex.
                 this._cancelBrowserRequest(
                     proxyRequest.request_id,
                     currentQueueAuthIndex,
                     proxyRequest.request_attempt_id
                 );
 
-                // Explicitly close the old queue before creating a new one
-                // This ensures waitingResolvers are properly rejected even if authIndex changed
                 try {
                     currentQueue.close("retry_creating_new_queue");
                 } catch (e) {
                     this.logger.debug(`[Request] Failed to close old queue before retry: ${e.message}`);
                 }
 
-                // Create a new message queue for the retry with CURRENT account
-                // Note: We keep the same requestId so the browser response routes to the new queue
-                // createMessageQueue will automatically close and remove any existing queue with the same ID from the registry
                 this.logger.debug(
                     `[Request] Creating new message queue for retry #${retryAttempt + 1} for request #${proxyRequest.request_id} (switching from account #${currentQueueAuthIndex} to #${this.currentAuthIndex})`
                 );
@@ -3769,16 +4348,13 @@ class RequestHandler {
                     this.currentAuthIndex,
                     proxyRequest.request_attempt_id
                 );
-                // Update tracked authIndex for the new queue
                 currentQueueAuthIndex = this.currentAuthIndex;
 
-                // Wait before the next retry
                 await new Promise(resolve => setTimeout(resolve, this.retryDelay));
                 retryAttempt++;
             }
         }
 
-        // After all retries, return the final failure result
         return { error: lastError, success: false };
     }
 
@@ -4092,11 +4668,13 @@ class RequestHandler {
                     // SSE format - send error event
                     try {
                         // Determine error code and type based on error classification
-                        let errorCode = 500;
+                        let errorCode = Number.isFinite(Number(error?.status)) ? Number(error.status) : 500;
                         let errorType = "api_error";
-                        let errorMessage = `Processing failed: ${errorMsg}`;
+                        let errorMessage =
+                            error?.localRouteError || error?.details?.localRouteError
+                                ? errorMsg
+                                : `Processing failed: ${errorMsg}`;
 
-                        // Use precise error type checking instead of string matching
                         if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
                             errorCode = 504;
                             errorType = "timeout_error";
@@ -4105,6 +4683,8 @@ class RequestHandler {
                             errorCode = 503;
                             errorType = "service_unavailable";
                             errorMessage = `Service unavailable: ${errorMsg}`;
+                        } else if (errorCode === 429) {
+                            errorType = "rate_limit_exceeded";
                         }
 
                         this._markTrackedResponseError(res, errorMessage, errorCode);
@@ -4135,6 +4715,7 @@ class RequestHandler {
                             let statusText = "INTERNAL";
                             if (errorCode === 504) statusText = "DEADLINE_EXCEEDED";
                             else if (errorCode === 503) statusText = "UNAVAILABLE";
+                            else if (errorCode === 429) statusText = "RESOURCE_EXHAUSTED";
                             res.write(
                                 `data: ${JSON.stringify({
                                     error: {
@@ -4163,7 +4744,7 @@ class RequestHandler {
                 } else if (res.__proxyResponseStreamMode === "fake") {
                     // Request-scoped fake stream mode - try to send an SSE-style error chunk
                     try {
-                        let status = 500;
+                        let status = Number.isFinite(Number(error?.status)) ? Number(error.status) : 500;
                         if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
                             status = 504;
                         } else if (this._isConnectionResetError(error)) {
@@ -4184,15 +4765,18 @@ class RequestHandler {
             }
         } else {
             this.logger.error(`[Request] Request processing error: ${errorMsg}`);
-            let status = 500;
-            // Use precise error type checking instead of string matching
+            let status = Number.isFinite(Number(error?.status)) ? Number(error.status) : 500;
             if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
                 status = 504;
             } else if (this._isConnectionResetError(error)) {
                 status = 503;
                 this.logger.info(`[Request] Queue closed, returning 503 Service Unavailable.`);
             }
-            this._sendErrorResponse(res, status, `Proxy error: ${errorMsg}`);
+            this._sendErrorResponse(
+                res,
+                status,
+                error?.localRouteError || error?.details?.localRouteError ? errorMsg : `Proxy error: ${errorMsg}`
+            );
         }
     }
 
@@ -4509,7 +5093,9 @@ class RequestHandler {
             headers: req.headers,
             is_generative:
                 req.method === "POST" &&
-                (req.path.includes("generateContent") || req.path.includes("streamGenerateContent")),
+                (req.path.includes("generateContent") ||
+                    req.path.includes("streamGenerateContent") ||
+                    req.path.includes(":predict")),
             method: req.method,
             path: cleanPath,
             query_params: req.query || {},

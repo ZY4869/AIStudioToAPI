@@ -5,6 +5,8 @@
 
 const DEFAULT_ACCOUNT_TIER = "default";
 const ACCOUNT_TIERS = Object.freeze([DEFAULT_ACCOUNT_TIER, "pro", "ultra"]);
+const DEFAULT_QUOTA_CATEGORY = "text";
+const QUOTA_CATEGORIES = Object.freeze([DEFAULT_QUOTA_CATEGORY, "image"]);
 const ACCOUNT_TIER_RANK = Object.freeze({
     default: 0,
     pro: 1,
@@ -34,6 +36,15 @@ const getAccountTierRank = tier => ACCOUNT_TIER_RANK[normalizeAccountTier(tier)]
 const satisfiesMinAccountTier = (accountTier, minAccountTier = DEFAULT_ACCOUNT_TIER) =>
     getAccountTierRank(accountTier) >= getAccountTierRank(minAccountTier);
 
+const normalizeQuotaCategory = value => {
+    if (typeof value !== "string") {
+        return DEFAULT_QUOTA_CATEGORY;
+    }
+
+    const normalized = value.trim().toLowerCase();
+    return QUOTA_CATEGORIES.includes(normalized) ? normalized : DEFAULT_QUOTA_CATEGORY;
+};
+
 const normalizeAuthDataAccountTier = authData => {
     if (!authData || typeof authData !== "object" || Array.isArray(authData)) {
         return authData;
@@ -60,14 +71,21 @@ const findModelConfig = (modelList, modelName) => {
 const getModelMinAccountTier = (modelList, modelName) =>
     normalizeAccountTier(findModelConfig(modelList, modelName)?.minAccountTier);
 
+const getModelQuotaCategory = (modelList, modelName) =>
+    normalizeQuotaCategory(findModelConfig(modelList, modelName)?.quotaCategory);
+
 module.exports = {
     ACCOUNT_TIERS,
     DEFAULT_ACCOUNT_TIER,
+    DEFAULT_QUOTA_CATEGORY,
     findModelConfig,
     getAccountTierRank,
     getModelMinAccountTier,
+    getModelQuotaCategory,
     isValidAccountTier,
     normalizeAccountTier,
     normalizeAuthDataAccountTier,
+    normalizeQuotaCategory,
+    QUOTA_CATEGORIES,
     satisfiesMinAccountTier,
 };

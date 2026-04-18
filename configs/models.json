@@ -152,7 +152,8 @@
             "temperature": 1.0,
             "topP": 0.95,
             "topK": 64,
-            "maxTemperature": 1.0
+            "maxTemperature": 1.0,
+            "quotaCategory": "image"
         },
         {
             "name": "models/gemini-2.5-flash-lite-preview-09-2025",
@@ -263,7 +264,8 @@
             "topP": 0.95,
             "topK": 64,
             "maxTemperature": 1.0,
-            "minAccountTier": "pro"
+            "minAccountTier": "pro",
+            "quotaCategory": "image"
         },
         {
             "name": "models/gemini-3-pro-image-preview",
@@ -277,7 +279,8 @@
             "topP": 0.95,
             "topK": 64,
             "maxTemperature": 1.0,
-            "minAccountTier": "pro"
+            "minAccountTier": "pro",
+            "quotaCategory": "image"
         },
         {
             "name": "models/gemini-robotics-er-1.5-preview",
@@ -334,7 +337,8 @@
             "description": "Vertex served Imagen 4.0 model",
             "inputTokenLimit": 480,
             "outputTokenLimit": 8192,
-            "supportedGenerationMethods": ["predict"]
+            "supportedGenerationMethods": ["predict"],
+            "quotaCategory": "image"
         },
         {
             "name": "models/imagen-4.0-ultra-generate-001",
@@ -343,7 +347,8 @@
             "description": "Vertex served Imagen 4.0 ultra model",
             "inputTokenLimit": 480,
             "outputTokenLimit": 8192,
-            "supportedGenerationMethods": ["predict"]
+            "supportedGenerationMethods": ["predict"],
+            "quotaCategory": "image"
         },
         {
             "name": "models/imagen-4.0-fast-generate-001",
@@ -352,7 +357,8 @@
             "description": "Vertex served Imagen 4.0 Fast model",
             "inputTokenLimit": 480,
             "outputTokenLimit": 8192,
-            "supportedGenerationMethods": ["predict"]
+            "supportedGenerationMethods": ["predict"],
+            "quotaCategory": "image"
         }
     ]
 }

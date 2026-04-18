@@ -208,6 +208,7 @@
     "proxySettings": "Proxy",
     "proxySettingsStatus": "Proxy Status",
     "quotaCooldownMinutes": "Quota Cooldown Minutes",
+    "quotaResetCountdown": "Quota Reset Countdown",
     "real": "Real",
     "realStream": "Real Streaming",
     "realtimeLogs": "Real-time Logs",

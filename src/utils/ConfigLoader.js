@@ -57,6 +57,8 @@ class ConfigLoader {
             immediateSwitchStatusCodes: [429, 503],
             maxContexts: 1,
             maxRetries: 3,
+            proImageDailyQuota: 100,
+            proTextDailyQuota: 100,
             quotaCooldownMinutes: 60,
             retryDelay: 2000,
             sleepWindows: [],
@@ -64,6 +66,8 @@ class ConfigLoader {
             streamingMode: "real",
             switchOnUses: 40,
             timezone: process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone,
+            ultraImageDailyQuota: 1000,
+            ultraTextDailyQuota: 1000,
             wsPort: 9998,
         };
 
@@ -85,6 +89,22 @@ class ConfigLoader {
         if (process.env.MAX_RETRIES) {
             const parsed = parseInt(process.env.MAX_RETRIES, 10);
             config.maxRetries = Number.isFinite(parsed) ? Math.max(1, parsed) : config.maxRetries;
+        }
+        if (process.env.PRO_TEXT_DAILY_QUOTA) {
+            const parsed = parseInt(process.env.PRO_TEXT_DAILY_QUOTA, 10);
+            config.proTextDailyQuota = Number.isFinite(parsed) ? Math.max(0, parsed) : config.proTextDailyQuota;
+        }
+        if (process.env.PRO_IMAGE_DAILY_QUOTA) {
+            const parsed = parseInt(process.env.PRO_IMAGE_DAILY_QUOTA, 10);
+            config.proImageDailyQuota = Number.isFinite(parsed) ? Math.max(0, parsed) : config.proImageDailyQuota;
+        }
+        if (process.env.ULTRA_TEXT_DAILY_QUOTA) {
+            const parsed = parseInt(process.env.ULTRA_TEXT_DAILY_QUOTA, 10);
+            config.ultraTextDailyQuota = Number.isFinite(parsed) ? Math.max(0, parsed) : config.ultraTextDailyQuota;
+        }
+        if (process.env.ULTRA_IMAGE_DAILY_QUOTA) {
+            const parsed = parseInt(process.env.ULTRA_IMAGE_DAILY_QUOTA, 10);
+            config.ultraImageDailyQuota = Number.isFinite(parsed) ? Math.max(0, parsed) : config.ultraImageDailyQuota;
         }
         if (process.env.RETRY_DELAY) {
             const parsed = parseInt(process.env.RETRY_DELAY, 10);
@@ -250,6 +270,9 @@ class ConfigLoader {
         );
         this.logger.info(`  Max Retries per Request: ${config.maxRetries} times`);
         this.logger.info(`  Quota Cooldown Minutes: ${config.quotaCooldownMinutes}`);
+        this.logger.info(
+            `  Daily Account Quotas (Pacific reset): pro(text=${config.proTextDailyQuota}, image=${config.proImageDailyQuota}), ultra(text=${config.ultraTextDailyQuota}, image=${config.ultraImageDailyQuota})`
+        );
         this.logger.info(`  Retry Delay: ${config.retryDelay}ms`);
         this.logger.info(
             `  Scheduled Sleep Windows: ${

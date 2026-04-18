@@ -5,18 +5,19 @@
  * Author: Ellinav, iBenzene, bbbugg
  */
 
-const { classifyQuotaCooldown } = require("../utils/QuotaCooldownClassifier");
+const { classifyQuotaCooldown, isQuotaExhaustedError } = require("../utils/QuotaCooldownClassifier");
 
 /**
  * Authentication Switcher Module
  * Handles account switching logic including single/multi-account modes and fallback mechanisms
  */
 class AuthSwitcher {
-    constructor(logger, config, authSource, browserManager) {
+    constructor(logger, config, authSource, browserManager, accountQuotaService = null) {
         this.logger = logger;
         this.config = config;
         this.authSource = authSource;
         this.browserManager = browserManager;
+        this.accountQuotaService = accountQuotaService;
         this.failureCount = 0;
         this.usageCount = 0;
         this.isSystemBusy = false;
@@ -229,6 +230,21 @@ class AuthSwitcher {
     }
 
     async handleRequestFailureAndSwitch(errorDetails, sendErrorCallback, options = {}) {
+        if (isQuotaExhaustedError(errorDetails)) {
+            const cooldownUntil =
+                this.accountQuotaService?.getNextResetAtIso?.() ||
+                classifyQuotaCooldown(errorDetails, this.config.quotaCooldownMinutes).cooldownUntil;
+
+            return this._handleQuotaCooldown(
+                {
+                    cooldownUntil,
+                    reason: "RESOURCE_EXHAUSTED",
+                },
+                sendErrorCallback,
+                options
+            );
+        }
+
         const cooldownDecision = classifyQuotaCooldown(errorDetails, this.config.quotaCooldownMinutes);
         if (cooldownDecision.isCooldown) {
             return this._handleQuotaCooldown(cooldownDecision, sendErrorCallback, options);

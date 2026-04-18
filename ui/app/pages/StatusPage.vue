@@ -363,6 +363,29 @@
                                         stroke-linejoin="round"
                                         style="margin-right: 6px"
                                     >
+                                        <path d="M12 8v4l3 3"></path>
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                    </svg>
+                                    {{ t("quotaResetCountdown") }}
+                                </span>
+                                <span class="value">
+                                    {{ quotaResetCountdownText }}
+                                </span>
+                            </div>
+                            <div class="status-item">
+                                <span class="label">
+                                    <svg
+                                        xmlns="http://www.w3.org/2000/svg"
+                                        width="14"
+                                        height="14"
+                                        viewBox="0 0 24 24"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        stroke-width="2"
+                                        stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                        style="margin-right: 6px"
+                                    >
                                         <line x1="18" y1="20" x2="18" y2="10"></line>
                                         <line x1="12" y1="20" x2="12" y2="4"></line>
                                         <line x1="6" y1="20" x2="6" y2="14"></line>
@@ -3746,6 +3769,9 @@ const state = reactive({
     logScrollTop: 0,
     maxContexts: 1,
     maxRetries: 3,
+    quotaResetAt: null,
+    quotaResetDeadlineAtMs: null,
+    quotaResetTimezone: null,
     releaseUrl: null,
     selectedAccounts: new Set(), // Selected account indices
     serviceConnected: false,
@@ -3841,6 +3867,14 @@ const idleSleepCountdownText = computed(() => {
 
     const remainingMs = new Date(state.sleepState.idleSleepDeadlineAt).getTime() - countdownNowMs.value;
     return formatCountdownDuration(remainingMs);
+});
+
+const quotaResetCountdownText = computed(() => {
+    if (!Number.isFinite(state.quotaResetDeadlineAtMs) || state.quotaResetDeadlineAtMs <= 0) {
+        return "-";
+    }
+
+    return formatCountdownDuration(state.quotaResetDeadlineAtMs - countdownNowMs.value);
 });
 
 // Total scanned accounts count
@@ -4603,6 +4637,16 @@ const updateStatus = data => {
     state.activeContextsCount = data.status.activeContextsCount || 0;
     state.maxContexts = data.status.maxContexts ?? 1;
     state.maxRetries = data.status.maxRetries ?? 3;
+    state.quotaResetAt = data.status.quotaResetAt || null;
+    state.quotaResetTimezone = data.status.quotaResetTimezone || null;
+
+    const quotaResetRemainingMs = Number(data.status.quotaResetRemainingMs);
+    const quotaResetAtMs = state.quotaResetAt ? new Date(state.quotaResetAt).getTime() : NaN;
+    state.quotaResetDeadlineAtMs = Number.isFinite(quotaResetRemainingMs)
+        ? Date.now() + Math.max(0, quotaResetRemainingMs)
+        : Number.isFinite(quotaResetAtMs)
+          ? quotaResetAtMs
+          : null;
 
     const validIndices = new Set(state.accountDetails.map(acc => acc.index));
     for (const idx of state.selectedAccounts) {

@@ -139,6 +139,7 @@ class StatusRoutes {
         });
 
         app.get("/api/status", isAuthenticated, async (req, res) => {
+            this.serverSystem.accountQuotaService?.ensureDailyStateSync();
             // Force a reload of auth sources on each status check for real-time accuracy
             const hasChanges = this.serverSystem.authSource.reloadAuthSources();
 
@@ -929,6 +930,7 @@ class StatusRoutes {
 
     _getStatusData() {
         const { config, requestHandler, authSource, browserManager, sleepManager } = this.serverSystem;
+        const accountQuotaService = this.serverSystem.accountQuotaService || null;
         const initialIndices = authSource.initialIndices || [];
         const invalidIndices = initialIndices.filter(i => !authSource.availableIndices.includes(i));
         const rotationIndices = authSource.getRotationIndices();
@@ -984,6 +986,9 @@ class StatusRoutes {
             config.failureThreshold > 0
                 ? `${requestHandler.failureCount} / ${config.failureThreshold}`
                 : requestHandler.failureCount;
+        const quotaResetAt = accountQuotaService ? accountQuotaService.getNextResetAtIso() : null;
+        const quotaResetRemainingMs = quotaResetAt ? Math.max(0, new Date(quotaResetAt).getTime() - Date.now()) : 0;
+        const quotaResetTimezone = accountQuotaService ? accountQuotaService.getTimezone() : null;
 
         return {
             logCount: displayLogs.length,
@@ -1016,6 +1021,9 @@ class StatusRoutes {
                 logMaxCount: limit,
                 maxContexts: config.maxContexts,
                 maxRetries: config.maxRetries,
+                quotaResetAt,
+                quotaResetRemainingMs,
+                quotaResetTimezone,
                 rotationIndicesRaw: rotationIndices,
                 sleepCooldownSettings: this.serverSystem.runtimeSettingsManager.getSleepCooldownSettings(),
                 sleepState: sleepManager ? sleepManager.getStatus() : null,

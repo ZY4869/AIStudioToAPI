@@ -306,6 +306,56 @@ class AuthSource {
         return this.rotationIndices;
     }
 
+    _getFilteredAvailableIndices(options = {}) {
+        const { includeCooldown = true, includeExpired = true } = options;
+        let indices = [...this.availableIndices];
+
+        if (!includeExpired) {
+            indices = indices.filter(index => !this.expiredIndices.includes(index));
+        }
+
+        if (!includeCooldown) {
+            indices = indices.filter(index => !this.cooldownInfoMap.has(index));
+        }
+
+        return indices.sort((a, b) => a - b);
+    }
+
+    _getCanonicalIndices(options = {}) {
+        const indices = this._getFilteredAvailableIndices(options);
+        const canonicalByEmail = new Map();
+        const standaloneIndices = [];
+
+        for (const index of indices) {
+            const emailKey = this._normalizeEmailKey(this.accountNameMap.get(index));
+            if (!emailKey) {
+                standaloneIndices.push(index);
+                continue;
+            }
+
+            canonicalByEmail.set(emailKey, index);
+        }
+
+        return [...standaloneIndices, ...canonicalByEmail.values()].sort((a, b) => a - b);
+    }
+
+    getAvailableIndicesByTier(minTier = DEFAULT_ACCOUNT_TIER, options = {}) {
+        this.cleanupExpiredCooldowns();
+
+        const { includeCooldown = true, includeExpired = true, rotationOnly = false } = options;
+        const indices = rotationOnly
+            ? this._getCanonicalIndices({
+                  includeCooldown,
+                  includeExpired,
+              })
+            : this._getFilteredAvailableIndices({
+                  includeCooldown,
+                  includeExpired,
+              });
+
+        return indices.filter(index => satisfiesMinAccountTier(this.getAccountTier(index), minTier));
+    }
+
     getAccountTier(index) {
         if (!Number.isInteger(index)) {
             return DEFAULT_ACCOUNT_TIER;
@@ -315,8 +365,11 @@ class AuthSource {
     }
 
     getEligibleRotationIndices(minTier = DEFAULT_ACCOUNT_TIER) {
-        this.cleanupExpiredCooldowns();
-        return this.rotationIndices.filter(index => satisfiesMinAccountTier(this.getAccountTier(index), minTier));
+        return this.getAvailableIndicesByTier(minTier, {
+            includeCooldown: false,
+            includeExpired: false,
+            rotationOnly: true,
+        });
     }
 
     hasEligibleRotationAccount(minTier = DEFAULT_ACCOUNT_TIER) {
@@ -371,6 +424,24 @@ class AuthSource {
         return this.availableIndices.filter(
             candidate => this._normalizeEmailKey(this.accountNameMap.get(candidate)) === emailKey
         );
+    }
+
+    getAccountIdentityKey(index) {
+        this.cleanupExpiredCooldowns();
+
+        if (!Number.isInteger(index) || !this.availableIndices.includes(index)) {
+            return null;
+        }
+
+        const canonicalIndex = this.getCanonicalIndex(index) ?? index;
+        const canonicalName = this.accountNameMap.get(canonicalIndex) || this.accountNameMap.get(index) || null;
+        const emailKey = this._normalizeEmailKey(canonicalName);
+
+        if (emailKey) {
+            return `email:${emailKey}`;
+        }
+
+        return `auth:${canonicalIndex}`;
     }
 
     _updateAuthFileSync(index, updater) {
@@ -431,6 +502,31 @@ class AuthSource {
         }
 
         return clearedIndices;
+    }
+
+    clearAllCooldownsSync() {
+        this.cleanupExpiredCooldowns();
+
+        const indicesToClear = [...this.cooldownInfoMap.keys()].sort((a, b) => a - b);
+        if (indicesToClear.length === 0) {
+            return [];
+        }
+
+        for (const index of indicesToClear) {
+            try {
+                this._updateAuthFileSync(index, authData => {
+                    delete authData.cooldownReason;
+                    delete authData.cooldownUntil;
+                    delete authData.lastCooldownAt;
+                });
+                this.cooldownInfoMap.delete(index);
+            } catch (error) {
+                this.logger.warn(`[Auth] Failed to clear cooldown for auth #${index}: ${error.message}`);
+            }
+        }
+
+        this._buildRotationIndices();
+        return indicesToClear;
     }
 
     async markAsCooldown(index, cooldownUntil, cooldownReason) {

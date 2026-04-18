@@ -208,6 +208,7 @@
     "proxySettings": "代理",
     "proxySettingsStatus": "代理状态",
     "quotaCooldownMinutes": "配额冷却分钟数",
+    "quotaResetCountdown": "额度刷新倒计时",
     "real": "真",
     "realStream": "真流式",
     "realtimeLogs": "实时日志",
