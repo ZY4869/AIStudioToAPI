@@ -23,6 +23,7 @@ const RequestHandler = require("./RequestHandler");
 const RuntimeSettingsManager = require("./RuntimeSettingsManager");
 const SleepManager = require("./SleepManager");
 const UsageStatsService = require("./UsageStatsService");
+const AccountQuotaService = require("./AccountQuotaService");
 const ConfigLoader = require("../utils/ConfigLoader");
 const WebRoutes = require("../routes/WebRoutes");
 const { DEFAULT_ACCOUNT_TIER, normalizeAccountTier } = require("../utils/AccountTierUtils");
@@ -50,6 +51,12 @@ class ProxyServerSystem extends EventEmitter {
             this.logger,
             path.join(process.cwd(), "data"),
             this.config.enableUsageStats
+        );
+        this.accountQuotaService = new AccountQuotaService(
+            this.authSource,
+            this.logger,
+            this.config,
+            path.join(process.cwd(), "data")
         );
 
         // Create ConnectionRegistry with lightweight reconnect callback
@@ -114,6 +121,13 @@ class ProxyServerSystem extends EventEmitter {
             this.config,
             this.authSource
         );
+        this.accountQuotaService.setDayResetHandler(({ dayBucket }) => {
+            this.requestHandler?.authSwitcher?.resetCounters();
+            if (this.requestHandler) {
+                this.requestHandler.needsSwitchingAfterRequest = null;
+            }
+            this.logger.info(`[Quota] Reset request-level counters after Pacific day rollover (${dayBucket}).`);
+        });
         this.sleepManager = new SleepManager(this.logger, this.config, this.browserManager, this.authSource);
         this.runtimeSettingsManager = new RuntimeSettingsManager(this.logger, this.config, this.sleepManager);
         this.sleepManager.setRequestHandler(this.requestHandler);
@@ -124,6 +138,7 @@ class ProxyServerSystem extends EventEmitter {
     }
 
     getExposedModelList() {
+        this.accountQuotaService?.ensureDailyStateSync();
         this.authSource.reloadAuthSources();
 
         return this.config.modelList.filter(model => {

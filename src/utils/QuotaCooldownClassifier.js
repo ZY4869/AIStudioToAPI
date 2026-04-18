@@ -78,6 +78,22 @@ function _resolveReason(rawTextLower) {
     return "quota";
 }
 
+function _collectNormalizedText(errorDetails) {
+    return [errorDetails?.message, errorDetails?.body, errorDetails?.details]
+        .filter(value => typeof value === "string" && value.trim())
+        .join(" ")
+        .toLowerCase();
+}
+
+function isQuotaExhaustedError(errorDetails) {
+    const normalizedText = _collectNormalizedText(errorDetails);
+    if (!normalizedText) {
+        return false;
+    }
+
+    return COOLDOWN_KEYWORDS.some(keyword => normalizedText.includes(keyword));
+}
+
 function _buildCooldownUntil(rawText, defaultCooldownMinutes, now) {
     const absoluteDate = _extractAbsoluteDate(rawText, now);
     if (absoluteDate) return absoluteDate;
@@ -96,7 +112,7 @@ function classifyQuotaCooldown(errorDetails, defaultCooldownMinutes = 60, now = 
     const rawText = [errorDetails?.message, errorDetails?.body, errorDetails?.details]
         .filter(value => typeof value === "string" && value.trim())
         .join(" ");
-    const normalizedText = rawText.toLowerCase();
+    const normalizedText = _collectNormalizedText(errorDetails);
 
     if (status !== 429 || !normalizedText) {
         return { isCooldown: false };
@@ -118,4 +134,5 @@ function classifyQuotaCooldown(errorDetails, defaultCooldownMinutes = 60, now = 
 
 module.exports = {
     classifyQuotaCooldown,
+    isQuotaExhaustedError,
 };

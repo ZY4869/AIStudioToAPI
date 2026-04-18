@@ -139,6 +139,7 @@ class StatusRoutes {
         });
 
         app.get("/api/status", isAuthenticated, async (req, res) => {
+            this.serverSystem.accountQuotaService?.ensureDailyStateSync();
             // Force a reload of auth sources on each status check for real-time accuracy
             const hasChanges = this.serverSystem.authSource.reloadAuthSources();
 
