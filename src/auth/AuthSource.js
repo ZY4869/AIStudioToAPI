@@ -15,6 +15,21 @@ const {
     normalizeAuthDataAccountTier,
     satisfiesMinAccountTier,
 } = require("../utils/AccountTierUtils");
+const {
+    ALL_COOLDOWN_SCOPE,
+    clearCooldownForScope,
+    cloneCooldownInfo,
+    createEmptyCooldownState,
+    extractCooldownState,
+    getCooldownInfoForScope,
+    getEarliestCooldownExpiryForScope,
+    hasAnyCooldown,
+    isCoolingDownForScope,
+    normalizeCooldownScope,
+    pruneExpiredCooldownState,
+    serializeCooldownState,
+    setCooldownForScope,
+} = require("../utils/CooldownStateUtils");
 
 /**
  * Authentication Source Management Module
@@ -151,15 +166,9 @@ class AuthSource {
                     if (authData.expired === true) {
                         this.expiredIndices.push(index);
                     }
-                    if (typeof authData.cooldownUntil === "string") {
-                        const cooldownUntil = new Date(authData.cooldownUntil);
-                        if (!Number.isNaN(cooldownUntil.getTime()) && cooldownUntil.getTime() > Date.now()) {
-                            this.cooldownInfoMap.set(index, {
-                                cooldownReason: authData.cooldownReason || null,
-                                cooldownUntil: cooldownUntil.toISOString(),
-                                lastCooldownAt: authData.lastCooldownAt || null,
-                            });
-                        }
+                    const cooldownState = extractCooldownState(authData, Date.now());
+                    if (hasAnyCooldown(cooldownState)) {
+                        this.cooldownInfoMap.set(index, cooldownState);
                     }
                 } catch (e) {
                     invalidSourceDescriptions.push(`auth-${index} (parse error)`);
@@ -202,9 +211,13 @@ class AuthSource {
         const emailKeyToIndices = new Map();
 
         // Only process non-expired and non-cooling accounts for rotation and deduplication
-        const rotatableIndices = this.availableIndices.filter(
-            idx => !this.expiredIndices.includes(idx) && !this.cooldownInfoMap.has(idx)
-        );
+        const rotatableIndices = this.availableIndices.filter(idx => {
+            if (this.expiredIndices.includes(idx)) {
+                return false;
+            }
+
+            return !this.isCoolingDown(idx, ALL_COOLDOWN_SCOPE);
+        });
 
         for (const index of rotatableIndices) {
             const accountName = this.accountNameMap.get(index);
@@ -261,11 +274,19 @@ class AuthSource {
             );
         }
 
-        if (this.cooldownInfoMap.size > 0) {
+        const anyCoolingIndices = this.getCooldownIndices();
+        const fullyCoolingIndices = this.getCooldownIndices(ALL_COOLDOWN_SCOPE);
+        if (anyCoolingIndices.length > 0) {
             this.logger.warn(
-                `[Auth] Detected ${this.cooldownInfoMap.size} cooling auth files: [${[
-                    ...this.cooldownInfoMap.keys(),
-                ].join(", ")}]. These accounts are excluded from automatic rotation.`
+                `[Auth] Detected ${anyCoolingIndices.length} auth files with scoped cooldowns: [${anyCoolingIndices.join(
+                    ", "
+                )}].`
+            );
+        }
+
+        if (fullyCoolingIndices.length > 0) {
+            this.logger.warn(
+                `[Auth] Fully cooled auth files excluded from automatic rotation: [${fullyCoolingIndices.join(", ")}].`
             );
         }
     }
@@ -307,7 +328,7 @@ class AuthSource {
     }
 
     _getFilteredAvailableIndices(options = {}) {
-        const { includeCooldown = true, includeExpired = true } = options;
+        const { cooldownScope = ALL_COOLDOWN_SCOPE, includeCooldown = true, includeExpired = true } = options;
         let indices = [...this.availableIndices];
 
         if (!includeExpired) {
@@ -315,7 +336,7 @@ class AuthSource {
         }
 
         if (!includeCooldown) {
-            indices = indices.filter(index => !this.cooldownInfoMap.has(index));
+            indices = indices.filter(index => !this.isCoolingDown(index, cooldownScope));
         }
 
         return indices.sort((a, b) => a - b);
@@ -342,13 +363,20 @@ class AuthSource {
     getAvailableIndicesByTier(minTier = DEFAULT_ACCOUNT_TIER, options = {}) {
         this.cleanupExpiredCooldowns();
 
-        const { includeCooldown = true, includeExpired = true, rotationOnly = false } = options;
+        const {
+            cooldownScope = ALL_COOLDOWN_SCOPE,
+            includeCooldown = true,
+            includeExpired = true,
+            rotationOnly = false,
+        } = options;
         const indices = rotationOnly
             ? this._getCanonicalIndices({
+                  cooldownScope,
                   includeCooldown,
                   includeExpired,
               })
             : this._getFilteredAvailableIndices({
+                  cooldownScope,
                   includeCooldown,
                   includeExpired,
               });
@@ -366,6 +394,7 @@ class AuthSource {
 
     getEligibleRotationIndices(minTier = DEFAULT_ACCOUNT_TIER) {
         return this.getAvailableIndicesByTier(minTier, {
+            cooldownScope: ALL_COOLDOWN_SCOPE,
             includeCooldown: false,
             includeExpired: false,
             rotationOnly: true,
@@ -387,31 +416,56 @@ class AuthSource {
         return this.duplicateGroups;
     }
 
-    getCooldownIndices() {
+    getCooldownIndices(scope = null) {
         this.cleanupExpiredCooldowns();
-        return [...this.cooldownInfoMap.keys()].sort((a, b) => a - b);
+        return this.availableIndices.filter(index => this.isCoolingDown(index, scope)).sort((a, b) => a - b);
     }
 
-    getCooldownInfo(index) {
+    getCooldownInfo(index, scope = null) {
         this.cleanupExpiredCooldowns();
-        return this.cooldownInfoMap.get(index) || null;
+        return getCooldownInfoForScope(this.cooldownInfoMap.get(index), scope);
     }
 
-    getEarliestCooldownExpiry() {
+    getCooldowns(index) {
         this.cleanupExpiredCooldowns();
+        const cooldownState = this.cooldownInfoMap.get(index);
+        return cooldownState
+            ? {
+                  image: cloneCooldownInfo(cooldownState.image),
+                  text: cloneCooldownInfo(cooldownState.text),
+              }
+            : createEmptyCooldownState();
+    }
+
+    getEarliestCooldownExpiry(scope = null, options = {}) {
+        this.cleanupExpiredCooldowns();
+        const { indices = null } = options;
         let earliest = null;
-        for (const info of this.cooldownInfoMap.values()) {
-            if (!info?.cooldownUntil) continue;
-            if (!earliest || new Date(info.cooldownUntil).getTime() < new Date(earliest).getTime()) {
-                earliest = info.cooldownUntil;
+        const targetIndices = Array.isArray(indices)
+            ? indices.filter(index => Number.isInteger(index))
+            : this.availableIndices;
+
+        for (const index of targetIndices) {
+            const cooldownUntil = getEarliestCooldownExpiryForScope(this.cooldownInfoMap.get(index), scope);
+            if (!cooldownUntil) {
+                continue;
+            }
+
+            if (!earliest || new Date(cooldownUntil).getTime() < new Date(earliest).getTime()) {
+                earliest = cooldownUntil;
             }
         }
         return earliest;
     }
 
-    isCoolingDown(index) {
+    hasAnyCooldown(index) {
         this.cleanupExpiredCooldowns();
-        return this.cooldownInfoMap.has(index);
+        return hasAnyCooldown(this.cooldownInfoMap.get(index));
+    }
+
+    isCoolingDown(index, scope = null) {
+        this.cleanupExpiredCooldowns();
+        return isCoolingDownForScope(this.cooldownInfoMap.get(index), scope);
     }
 
     _getCooldownSiblingIndices(index) {
@@ -451,6 +505,14 @@ class AuthSource {
         fs.writeFileSync(authFilePath, JSON.stringify(authData, null, 2));
     }
 
+    async _updateAuthFileAsync(index, updater) {
+        const authFilePath = path.join(process.cwd(), "configs", "auth", `auth-${index}.json`);
+        const fileContent = await fsPromises.readFile(authFilePath, "utf-8");
+        const authData = normalizeAuthDataAccountTier(JSON.parse(fileContent));
+        updater(authData);
+        await fsPromises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
+    }
+
     setAccountTier(index, accountTier) {
         if (!Number.isInteger(index) || !this.availableIndices.includes(index)) {
             throw new Error(`Auth file for account #${index} does not exist or is not editable.`);
@@ -473,53 +535,67 @@ class AuthSource {
         if (this.cooldownInfoMap.size === 0) return [];
 
         const now = Date.now();
-        const clearedIndices = [];
+        const clearedEntries = [];
 
-        for (const [index, info] of [...this.cooldownInfoMap.entries()]) {
-            const cooldownUntil = new Date(info.cooldownUntil).getTime();
-            if (!Number.isFinite(cooldownUntil) || cooldownUntil > now) {
+        for (const [index, cooldownState] of [...this.cooldownInfoMap.entries()]) {
+            const { clearedScopes, nextState } = pruneExpiredCooldownState(cooldownState, now);
+            if (clearedScopes.length === 0) {
                 continue;
             }
 
             try {
                 this._updateAuthFileSync(index, authData => {
-                    delete authData.cooldownReason;
-                    delete authData.cooldownUntil;
-                    delete authData.lastCooldownAt;
+                    serializeCooldownState(authData, nextState);
                 });
             } catch (error) {
                 this.logger.warn(`[Auth] Failed to clear cooldown for auth #${index}: ${error.message}`);
                 continue;
             }
 
-            this.cooldownInfoMap.delete(index);
-            clearedIndices.push(index);
+            if (hasAnyCooldown(nextState)) {
+                this.cooldownInfoMap.set(index, nextState);
+            } else {
+                this.cooldownInfoMap.delete(index);
+            }
+            clearedEntries.push({ index, scopes: clearedScopes });
         }
 
-        if (clearedIndices.length > 0) {
+        if (clearedEntries.length > 0) {
             this._buildRotationIndices();
-            this.logger.info(`[Auth] Cooldown expired for auth files: [${clearedIndices.join(", ")}].`);
+            this.logger.info(
+                `[Auth] Cooldown expired for auth files: ${clearedEntries
+                    .map(entry => `#${entry.index}(${entry.scopes.join("/")})`)
+                    .join(", ")}.`
+            );
         }
 
-        return clearedIndices;
+        return clearedEntries;
     }
 
-    clearAllCooldownsSync() {
+    clearAllCooldownsSync(scope = ALL_COOLDOWN_SCOPE) {
         this.cleanupExpiredCooldowns();
 
-        const indicesToClear = [...this.cooldownInfoMap.keys()].sort((a, b) => a - b);
+        const normalizedScope = normalizeCooldownScope(scope, {
+            allowAll: true,
+            fallback: ALL_COOLDOWN_SCOPE,
+        });
+        const indicesToClear = this.getCooldownIndices(normalizedScope === ALL_COOLDOWN_SCOPE ? null : normalizedScope);
         if (indicesToClear.length === 0) {
             return [];
         }
 
         for (const index of indicesToClear) {
             try {
+                const cooldownState = this.cooldownInfoMap.get(index) || createEmptyCooldownState();
+                const { nextState } = clearCooldownForScope(cooldownState, normalizedScope);
                 this._updateAuthFileSync(index, authData => {
-                    delete authData.cooldownReason;
-                    delete authData.cooldownUntil;
-                    delete authData.lastCooldownAt;
+                    serializeCooldownState(authData, nextState);
                 });
-                this.cooldownInfoMap.delete(index);
+                if (hasAnyCooldown(nextState)) {
+                    this.cooldownInfoMap.set(index, nextState);
+                } else {
+                    this.cooldownInfoMap.delete(index);
+                }
             } catch (error) {
                 this.logger.warn(`[Auth] Failed to clear cooldown for auth #${index}: ${error.message}`);
             }
@@ -529,12 +605,12 @@ class AuthSource {
         return indicesToClear;
     }
 
-    async markAsCooldown(index, cooldownUntil, cooldownReason) {
+    async markAsCooldown(index, cooldownUntil, cooldownReason, scope) {
         this.cleanupExpiredCooldowns();
 
         if (!this.availableIndices.includes(index)) {
             this.logger.warn(`[Auth] Cannot mark non-existent auth #${index} as cooling down`);
-            return { markedIndices: [], updated: false };
+            return { markedIndices: [], scope: normalizeCooldownScope(scope), updated: false };
         }
 
         const until = new Date(cooldownUntil);
@@ -542,69 +618,87 @@ class AuthSource {
             throw new Error(`Invalid cooldownUntil for auth #${index}: ${cooldownUntil}`);
         }
 
+        const normalizedScope = normalizeCooldownScope(scope);
         const indicesToMark = this._getCooldownSiblingIndices(index);
         const lastCooldownAt = new Date().toISOString();
         const markedIndices = [];
+        let shouldRebalance = false;
 
         for (const targetIndex of indicesToMark) {
-            const existingInfo = this.cooldownInfoMap.get(targetIndex);
+            const existingState = this.cooldownInfoMap.get(targetIndex) || createEmptyCooldownState();
+            const existingInfo = existingState[normalizedScope];
             const existingUntil = existingInfo?.cooldownUntil ? new Date(existingInfo.cooldownUntil) : null;
             const effectiveUntil =
                 existingUntil && existingUntil.getTime() > until.getTime()
                     ? existingUntil.toISOString()
                     : until.toISOString();
-
-            const authFilePath = path.join(process.cwd(), "configs", "auth", `auth-${targetIndex}.json`);
-            const fileContent = await fsPromises.readFile(authFilePath, "utf-8");
-            const authData = JSON.parse(fileContent);
-            authData.cooldownReason = cooldownReason;
-            authData.cooldownUntil = effectiveUntil;
-            authData.lastCooldownAt = lastCooldownAt;
-            await fsPromises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
-
-            this.cooldownInfoMap.set(targetIndex, {
+            const nextState = setCooldownForScope(existingState, normalizedScope, {
                 cooldownReason,
                 cooldownUntil: effectiveUntil,
                 lastCooldownAt,
             });
+
+            await this._updateAuthFileAsync(targetIndex, authData => {
+                serializeCooldownState(authData, nextState);
+            });
+
+            this.cooldownInfoMap.set(targetIndex, nextState);
+            shouldRebalance = shouldRebalance || this.isCoolingDown(targetIndex, ALL_COOLDOWN_SCOPE);
             markedIndices.push(targetIndex);
         }
 
         this._buildRotationIndices();
         this.logger.warn(
-            `[Auth] Marked auth files [${markedIndices.join(", ")}] as cooling down until ${until.toISOString()} (${cooldownReason}).`
+            `[Auth] Marked auth files [${markedIndices.join(", ")}] as ${normalizedScope} cooling down until ${until.toISOString()} (${cooldownReason}).`
         );
 
-        return { cooldownUntil: until.toISOString(), markedIndices, updated: markedIndices.length > 0 };
+        return {
+            cooldownUntil: until.toISOString(),
+            markedIndices,
+            scope: normalizedScope,
+            shouldRebalance,
+            updated: markedIndices.length > 0,
+        };
     }
 
-    async clearCooldown(index) {
+    async clearCooldown(index, scope = ALL_COOLDOWN_SCOPE) {
         this.cleanupExpiredCooldowns();
 
         if (!this.availableIndices.includes(index)) {
-            return false;
+            return {
+                clearedIndices: [],
+                scope: normalizeCooldownScope(scope, { allowAll: true, fallback: ALL_COOLDOWN_SCOPE }),
+                updated: false,
+            };
         }
 
+        const normalizedScope = normalizeCooldownScope(scope, {
+            allowAll: true,
+            fallback: ALL_COOLDOWN_SCOPE,
+        });
         const indicesToClear = this._getCooldownSiblingIndices(index).filter(targetIndex =>
-            this.cooldownInfoMap.has(targetIndex)
+            this.isCoolingDown(targetIndex, normalizedScope === ALL_COOLDOWN_SCOPE ? null : normalizedScope)
         );
         if (indicesToClear.length === 0) {
-            return false;
+            return { clearedIndices: [], scope: normalizedScope, updated: false };
         }
 
         for (const targetIndex of indicesToClear) {
-            const authFilePath = path.join(process.cwd(), "configs", "auth", `auth-${targetIndex}.json`);
-            const fileContent = await fsPromises.readFile(authFilePath, "utf-8");
-            const authData = JSON.parse(fileContent);
-            delete authData.cooldownReason;
-            delete authData.cooldownUntil;
-            delete authData.lastCooldownAt;
-            await fsPromises.writeFile(authFilePath, JSON.stringify(authData, null, 2));
-            this.cooldownInfoMap.delete(targetIndex);
+            const cooldownState = this.cooldownInfoMap.get(targetIndex) || createEmptyCooldownState();
+            const { nextState } = clearCooldownForScope(cooldownState, normalizedScope);
+            await this._updateAuthFileAsync(targetIndex, authData => {
+                serializeCooldownState(authData, nextState);
+            });
+
+            if (hasAnyCooldown(nextState)) {
+                this.cooldownInfoMap.set(targetIndex, nextState);
+            } else {
+                this.cooldownInfoMap.delete(targetIndex);
+            }
         }
 
         this._buildRotationIndices();
-        return true;
+        return { clearedIndices: indicesToClear, scope: normalizedScope, updated: true };
     }
 
     /**

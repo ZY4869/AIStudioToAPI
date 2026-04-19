@@ -19,6 +19,7 @@ const {
     getModelMinAccountTier,
     getModelQuotaCategory,
 } = require("../utils/AccountTierUtils");
+const { ALL_COOLDOWN_SCOPE } = require("../utils/CooldownStateUtils");
 const { isQuotaExhaustedError } = require("../utils/QuotaCooldownClassifier");
 
 // Timeout constants (in milliseconds)
@@ -193,6 +194,7 @@ class RequestHandler {
                 ? "All available accounts are cooling down."
                 : "Service temporarily unavailable: Scheduled sleep window is active.");
         const metadata = {
+            ...(decision.cooldownScope ? { cooldownScope: decision.cooldownScope } : {}),
             ...(decision.earliestAvailableAt ? { earliestAvailableAt: decision.earliestAvailableAt } : {}),
             ...(decision.reason ? { reason: decision.reason } : {}),
             ...(decision.wakeAt ? { wakeAt: decision.wakeAt } : {}),
@@ -204,18 +206,35 @@ class RequestHandler {
         });
     }
 
-    _buildAllAccountsCoolingDownDecision() {
-        const cooledDownIndices = this.authSource.getCooldownIndices();
+    _buildAllAccountsCoolingDownDecision(routeContext = null) {
+        const cooldownScope = routeContext?.quotaCategory || null;
+        const configuredIndices = Array.isArray(routeContext?.configuredIndices)
+            ? routeContext.configuredIndices
+            : null;
+        const cooledDownIndices = configuredIndices
+            ? configuredIndices.filter(index => this.authSource.isCoolingDown(index, cooldownScope))
+            : this.authSource.getCooldownIndices();
         if (cooledDownIndices.length === 0) {
             return null;
         }
 
-        if (this.authSource.getRotationIndices().length > 0) {
+        const hasRouteAvailableAccounts = routeContext
+            ? this.authSource.getAvailableIndicesByTier(routeContext.requiredTier, {
+                  cooldownScope: routeContext.quotaCategory,
+                  includeCooldown: false,
+                  includeExpired: false,
+                  rotationOnly: true,
+              }).length > 0
+            : this.authSource.getRotationIndices().length > 0;
+        if (hasRouteAvailableAccounts) {
             return null;
         }
 
-        const earliestAvailableAt = this.authSource.getEarliestCooldownExpiry();
+        const earliestAvailableAt = this.authSource.getEarliestCooldownExpiry(cooldownScope, {
+            indices: configuredIndices,
+        });
         return {
+            cooldownScope: cooldownScope || ALL_COOLDOWN_SCOPE,
             cooledDownIndices,
             earliestAvailableAt,
             message: earliestAvailableAt
@@ -261,6 +280,7 @@ class RequestHandler {
             rotationOnly: true,
         });
         routeContext.rotatableIndices = this.authSource.getAvailableIndicesByTier(routeContext.requiredTier, {
+            cooldownScope: routeContext.quotaCategory,
             includeCooldown: false,
             includeExpired: false,
             rotationOnly: true,
@@ -461,6 +481,11 @@ class RequestHandler {
                     ? this._getRouteFailoverAllowedIndices(routeContext)
                     : this._refreshRouteContextAllowedIndices(routeContext)),
             ],
+            cooldownScope: routeContext.quotaCategory,
+            refreshAllowedIndices: () =>
+                applyFailoverLedger
+                    ? this._getRouteFailoverAllowedIndices(routeContext)
+                    : this._refreshRouteContextAllowedIndices(routeContext),
         };
     }
 
@@ -1217,7 +1242,7 @@ class RequestHandler {
         return true;
     }
 
-    async _markCurrentAccountQuotaCooldown(errorPayload = {}) {
+    async _markCurrentAccountQuotaCooldown(errorPayload = {}, routeContext = null) {
         const currentIndex = this.currentAuthIndex;
         const cooldownUntil = this._getRouteNextResetAtIso();
         if (!Number.isInteger(currentIndex) || currentIndex < 0 || !cooldownUntil) {
@@ -1228,19 +1253,26 @@ class RequestHandler {
             typeof errorPayload?.reason === "string" && errorPayload.reason.trim()
                 ? errorPayload.reason
                 : "RESOURCE_EXHAUSTED";
-
-        await this.authSource.markAsCooldown(currentIndex, cooldownUntil, cooldownReason);
+        const cooldownScope = routeContext?.quotaCategory || DEFAULT_QUOTA_CATEGORY;
+        const cooldownResult = await this.authSource.markAsCooldown(
+            currentIndex,
+            cooldownUntil,
+            cooldownReason,
+            cooldownScope
+        );
         this.authSwitcher.resetCounters();
 
-        try {
-            await this.browserManager.closeContext(currentIndex);
-        } catch (error) {
-            this.logger.warn(`[Route] Failed to close quota-exhausted account #${currentIndex}: ${error.message}`);
-        }
+        if (cooldownResult.shouldRebalance) {
+            try {
+                await this.browserManager.closeContext(currentIndex);
+            } catch (error) {
+                this.logger.warn(`[Route] Failed to close quota-exhausted account #${currentIndex}: ${error.message}`);
+            }
 
-        this.browserManager.rebalanceContextPool().catch(error => {
-            this.logger.error(`[Route] Background rebalance failed after quota cooldown: ${error.message}`);
-        });
+            this.browserManager.rebalanceContextPool().catch(error => {
+                this.logger.error(`[Route] Background rebalance failed after quota cooldown: ${error.message}`);
+            });
+        }
 
         return cooldownUntil;
     }
@@ -1305,7 +1337,7 @@ class RequestHandler {
         }
 
         if (isQuotaExhaustedError(errorDetails) || isQuotaExhaustedError(rawError)) {
-            const cooldownUntil = await this._markCurrentAccountQuotaCooldown(errorDetails);
+            const cooldownUntil = await this._markCurrentAccountQuotaCooldown(errorDetails, routeContext);
             if (cooldownUntil) {
                 this.logger.warn(
                     `[Route] Upstream quota exhaustion detected for account #${failedAuthIndex}. Cooling down until ${cooldownUntil}.`
@@ -1486,7 +1518,7 @@ class RequestHandler {
                 if (routeContext?.isRestrictedModel) {
                     this._sendInsufficientAccountTierResponse(res, format, routeContext);
                 } else {
-                    const cooldownDecision = this._buildAllAccountsCoolingDownDecision();
+                    const cooldownDecision = this._buildAllAccountsCoolingDownDecision(routeContext);
                     if (cooldownDecision) {
                         this._sendPreflightBlockedResponse(res, format, cooldownDecision);
                     } else {
@@ -1550,7 +1582,7 @@ class RequestHandler {
                 this._sendInsufficientAccountTierResponse(res, format, routeContext);
                 recoverySuccess = false;
             } else {
-                const cooldownDecision = this._buildAllAccountsCoolingDownDecision();
+                const cooldownDecision = this._buildAllAccountsCoolingDownDecision(routeContext);
                 if (cooldownDecision) {
                     this._sendPreflightBlockedResponse(res, format, cooldownDecision);
                 } else {

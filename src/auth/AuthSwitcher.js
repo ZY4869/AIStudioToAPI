@@ -6,6 +6,7 @@
  */
 
 const { classifyQuotaCooldown, isQuotaExhaustedError } = require("../utils/QuotaCooldownClassifier");
+const { TEXT_COOLDOWN_SCOPE, normalizeCooldownScope } = require("../utils/CooldownStateUtils");
 
 /**
  * Authentication Switcher Module
@@ -39,6 +40,18 @@ class AuthSwitcher {
 
         const allowedSet = new Set(allowedIndices.filter(Number.isInteger));
         return rotationIndices.filter(index => allowedSet.has(index));
+    }
+
+    _resolveSwitchOptions(options = {}) {
+        const nextOptions = {
+            ...options,
+        };
+
+        if (typeof options.refreshAllowedIndices === "function") {
+            nextOptions.allowedIndices = options.refreshAllowedIndices();
+        }
+
+        return nextOptions;
     }
 
     async switchToNextAuth(options = {}) {
@@ -277,7 +290,7 @@ class AuthSwitcher {
             }
 
             try {
-                const result = await this.switchToNextAuth(options);
+                const result = await this.switchToNextAuth(this._resolveSwitchOptions(options));
                 if (!result.success) {
                     this.logger.warn(`[Auth] Account switch skipped: ${result.reason}`);
                     if (sendErrorCallback) {
@@ -319,24 +332,36 @@ class AuthSwitcher {
             return { reason: "no_active_account", success: false };
         }
 
+        const cooldownScope = normalizeCooldownScope(options.cooldownScope, {
+            allowAll: true,
+            fallback: TEXT_COOLDOWN_SCOPE,
+        });
         this.logger.warn(
-            `[Auth] Quota exhaustion detected for account #${currentIndex}. Cooling down until ${cooldownDecision.cooldownUntil}.`
+            `[Auth] Quota exhaustion detected for account #${currentIndex} (${cooldownScope}). Cooling down until ${cooldownDecision.cooldownUntil}.`
         );
 
-        await this.authSource.markAsCooldown(currentIndex, cooldownDecision.cooldownUntil, cooldownDecision.reason);
+        const cooldownResult = await this.authSource.markAsCooldown(
+            currentIndex,
+            cooldownDecision.cooldownUntil,
+            cooldownDecision.reason,
+            cooldownScope
+        );
         this.resetCounters();
 
-        try {
-            await this.browserManager.closeContext(currentIndex);
-        } catch (error) {
-            this.logger.warn(`[Auth] Failed to close cooling account #${currentIndex}: ${error.message}`);
+        if (cooldownResult.shouldRebalance) {
+            try {
+                await this.browserManager.closeContext(currentIndex);
+            } catch (error) {
+                this.logger.warn(`[Auth] Failed to close fully cooled account #${currentIndex}: ${error.message}`);
+            }
+
+            this.browserManager.rebalanceContextPool().catch(error => {
+                this.logger.error(`[Auth] Background rebalance failed after cooldown: ${error.message}`);
+            });
         }
 
-        this.browserManager.rebalanceContextPool().catch(error => {
-            this.logger.error(`[Auth] Background rebalance failed after cooldown: ${error.message}`);
-        });
-
-        const remainingAccounts = this._resolveAvailableRotationIndices(options.allowedIndices);
+        const switchOptions = this._resolveSwitchOptions(options);
+        const remainingAccounts = this._resolveAvailableRotationIndices(switchOptions.allowedIndices);
         if (remainingAccounts.length === 0) {
             const message = `All available accounts are cooling down until ${cooldownDecision.cooldownUntil}.`;
             this.logger.warn(`[Auth] ${message}`);
@@ -349,7 +374,7 @@ class AuthSwitcher {
         }
 
         try {
-            const result = await this.switchToNextAuth(options);
+            const result = await this.switchToNextAuth(switchOptions);
             if (result.success) {
                 const successMessage = `Account #${currentIndex} cooled down. Switched to account #${result.newIndex}.`;
                 this.logger.info(`[Auth] ${successMessage}`);

@@ -797,6 +797,13 @@
                                         <path d="m9 13 3 3 3-3" />
                                     </svg>
                                 </button>
+                                <CooldownActionMenu
+                                    :disabled="isBusy || state.accountDetails.length === 0"
+                                    button-class="btn-warning"
+                                    size="normal"
+                                    :title="hasSelection ? t('clearSelectedCooldown') : t('clearAllCooldown')"
+                                    @select="scope => clearCooldowns(scope)"
+                                />
                             </div>
                             <!-- Right: Add, upload, and deduplicate -->
                             <div class="icon-buttons">
@@ -897,8 +904,13 @@
                                         <span v-if="item.isExpired" class="expired-badge">
                                             {{ t("tagExpired") }}
                                         </span>
-                                        <span v-if="item.isCoolingDown" class="cooldown-badge">
-                                            {{ t("tagCoolingDown") }}
+                                        <span
+                                            v-for="cooldown in getAccountCooldownEntries(item)"
+                                            :key="`${item.index}-${cooldown.scope}`"
+                                            class="cooldown-badge"
+                                            :class="`is-${cooldown.scope}`"
+                                        >
+                                            {{ cooldown.label }}
                                         </span>
                                         <AccountTierEditor
                                             v-if="!item.isInvalid"
@@ -955,6 +967,12 @@
                                             <polyline points="20 6 9 17 4 12"></polyline>
                                         </svg>
                                     </button>
+                                    <CooldownActionMenu
+                                        :disabled="isBusy || item.isInvalid"
+                                        button-class="btn-warning"
+                                        :title="t('clearAccountCooldown')"
+                                        @select="scope => clearCooldowns(scope, [item.index])"
+                                    />
                                     <button
                                         class="btn-danger"
                                         :disabled="isBusy"
@@ -2805,6 +2823,7 @@ import escapeHtml from "../utils/escapeHtml";
 import I18n from "../utils/i18n";
 import { useTheme } from "../utils/useTheme";
 import AccountTierEditor from "../components/AccountTierEditor.vue";
+import CooldownActionMenu from "../components/CooldownActionMenu.vue";
 import EnvVarTooltip from "../components/EnvVarTooltip.vue";
 
 const router = useRouter();
@@ -3746,6 +3765,16 @@ const state = reactive({
     apiKeySource: "",
     browserConnected: false,
     cooldownSummary: {
+        byCategory: {
+            image: {
+                cooledDownIndicesRaw: [],
+                earliestAvailableAt: null,
+            },
+            text: {
+                cooledDownIndicesRaw: [],
+                earliestAvailableAt: null,
+            },
+        },
         cooledDownIndicesRaw: [],
         earliestAvailableAt: null,
     },
@@ -4189,15 +4218,58 @@ const getAccountDisplayName = account => {
 
 const getAccountTooltipContent = account => {
     const baseName = getAccountDisplayName(account);
-    if (!account.isCoolingDown) {
+    const cooldownEntries = getAccountCooldownEntries(account);
+    if (cooldownEntries.length === 0) {
         return baseName;
     }
 
-    const remainingMs = account.cooldownUntil
-        ? new Date(account.cooldownUntil).getTime() - countdownNowMs.value
-        : account.cooldownRemainingMs;
+    const cooldownContent = cooldownEntries
+        .map(entry => {
+            const remainingMs = entry.cooldownUntil
+                ? new Date(entry.cooldownUntil).getTime() - countdownNowMs.value
+                : 0;
+            return `${entry.label}: ${t("cooldownUntil")} ${formatDateTime(entry.cooldownUntil)} | ${t(
+                "cooldownRemaining"
+            )} ${formatRemainingDuration(remainingMs)}`;
+        })
+        .join(" | ");
 
-    return `${baseName} | ${t("cooldownUntil")}: ${formatDateTime(account.cooldownUntil)} | ${t("cooldownRemaining")}: ${formatRemainingDuration(remainingMs)}`;
+    return `${baseName} | ${cooldownContent}`;
+};
+
+const getCooldownScopeLabel = scope => {
+    if (scope === "image") {
+        return t("cooldownScopeImage");
+    }
+
+    if (scope === "all") {
+        return t("cooldownScopeAll");
+    }
+
+    return t("cooldownScopeText");
+};
+
+const getAccountCooldownEntries = account => {
+    const cooldowns = account?.cooldowns || {};
+    const entries = [];
+
+    if (cooldowns.text?.cooldownUntil) {
+        entries.push({
+            cooldownUntil: cooldowns.text.cooldownUntil,
+            label: t("tagTextCoolingDown"),
+            scope: "text",
+        });
+    }
+
+    if (cooldowns.image?.cooldownUntil) {
+        entries.push({
+            cooldownUntil: cooldowns.image.cooldownUntil,
+            label: t("tagImageCoolingDown"),
+            scope: "image",
+        });
+    }
+
+    return entries;
 };
 
 const addUser = () => {
@@ -4352,6 +4424,97 @@ const deduplicateAuth = () => {
             } finally {
                 state.isSwitchingAccount = false;
                 notification.close();
+                updateContent();
+            }
+        })
+        .catch(e => {
+            if (e !== "cancel") {
+                console.error(e);
+            }
+        });
+};
+
+const clearCooldowns = (scope, targetIndices = null) => {
+    const resolvedIndices =
+        Array.isArray(targetIndices) && targetIndices.length > 0
+            ? [...new Set(targetIndices)]
+            : hasSelection.value
+              ? Array.from(state.selectedAccounts)
+              : null;
+    const isGlobalTarget = !Array.isArray(resolvedIndices);
+    const targetCount = isGlobalTarget ? state.accountDetails.length : resolvedIndices.length;
+
+    if (!isGlobalTarget && targetCount === 0) {
+        ElMessage.warning(t("noAccountSelected"));
+        return;
+    }
+
+    const confirmMessage =
+        !isGlobalTarget && targetCount === 1
+            ? t("confirmClearAccountCooldown", {
+                  index: resolvedIndices[0],
+                  scopeLabel: getCooldownScopeLabel(scope),
+              })
+            : isGlobalTarget
+              ? t("confirmClearAllCooldown", { scopeLabel: getCooldownScopeLabel(scope) })
+              : t("confirmClearSelectedCooldown", {
+                    count: targetCount,
+                    scopeLabel: getCooldownScopeLabel(scope),
+                });
+
+    ElMessageBox.confirm(confirmMessage, t("warningTitle"), {
+        cancelButtonText: t("cancel"),
+        confirmButtonText: t("ok"),
+        lockScroll: false,
+        type: "warning",
+    })
+        .then(async () => {
+            const notification = ElNotification({
+                duration: 0,
+                message: t("operationInProgress"),
+                title: t("warningTitle"),
+                type: "warning",
+            });
+            state.isSwitchingAccount = true;
+            try {
+                const payload = {
+                    scope,
+                };
+                if (!isGlobalTarget) {
+                    payload.indices = resolvedIndices;
+                }
+
+                const res = await fetch("/api/accounts/cooldown/clear", {
+                    body: JSON.stringify(payload),
+                    headers: { "Content-Type": "application/json" },
+                    method: "POST",
+                });
+                const data = await res.json();
+                const messageParams = {
+                    ...data,
+                    clearedCount: data.clearedIndices?.length || 0,
+                    count: targetCount,
+                    quotaResetCount: data.quotaResetIndices?.length || 0,
+                    scopeLabel: getCooldownScopeLabel(scope),
+                };
+
+                if (res.status === 207) {
+                    ElMessage.warning(t(data.message || "accountCooldownClearPartial", messageParams));
+                } else if (res.ok) {
+                    const messageKey = data.message || "accountCooldownClearSuccess";
+                    if (messageKey === "accountCooldownClearNoop") {
+                        ElMessage.info(t(messageKey, messageParams));
+                    } else {
+                        ElMessage.success(t(messageKey, messageParams));
+                    }
+                } else {
+                    ElMessage.error(getApiErrorMessage(data));
+                }
+            } catch (err) {
+                ElMessage.error(t("accountCooldownClearFailed", { error: err.message || err }));
+            } finally {
+                notification.close();
+                state.isSwitchingAccount = false;
                 updateContent();
             }
         })
@@ -4657,6 +4820,16 @@ const updateStatus = data => {
     state.browserConnected = data.status.browserConnected;
     state.apiKeySource = data.status.apiKeySource;
     state.cooldownSummary = data.status.cooldownSummary || {
+        byCategory: {
+            image: {
+                cooledDownIndicesRaw: [],
+                earliestAvailableAt: null,
+            },
+            text: {
+                cooledDownIndicesRaw: [],
+                earliestAvailableAt: null,
+            },
+        },
         cooledDownIndicesRaw: [],
         earliestAvailableAt: null,
     };
@@ -5620,12 +5793,19 @@ watchEffect(() => {
 .cooldown-badge {
     font-size: 0.75rem;
     padding: 2px 8px;
-    background: @warning-color;
     color: @text-on-primary;
     border-radius: 12px;
     flex-shrink: 0;
     margin-left: 0;
     margin-right: 6px;
+
+    &.is-text {
+        background: #e6a23c;
+    }
+
+    &.is-image {
+        background: #409eff;
+    }
 }
 
 .account-tier-unavailable {

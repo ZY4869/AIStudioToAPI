@@ -7,6 +7,7 @@ const fs = require("fs");
 const path = require("path");
 const { DEFAULT_QUOTA_CATEGORY } = require("../utils/AccountTierUtils");
 const { getNextPacificMidnightIso, getPacificDayBucket, PACIFIC_TIME_ZONE } = require("../utils/PacificTimeUtils");
+const { ALL_COOLDOWN_SCOPE, normalizeCooldownScope } = require("../utils/CooldownStateUtils");
 
 class AccountQuotaService {
     constructor(authSource, logger, config, dataDir) {
@@ -105,6 +106,42 @@ class AccountQuotaService {
             quotaCategory: normalizedCategory,
             used: nextUsed,
         };
+    }
+
+    resetQuotaUsage(index, scope = ALL_COOLDOWN_SCOPE) {
+        this.ensureDailyStateSync();
+
+        const normalizedScope = normalizeCooldownScope(scope, {
+            allowAll: true,
+            fallback: ALL_COOLDOWN_SCOPE,
+        });
+        const { accountKey, record } = this._getAccountRecord(index);
+        const nextRecord = {
+            image: record.image || 0,
+            text: record.text || 0,
+        };
+
+        if (normalizedScope === ALL_COOLDOWN_SCOPE) {
+            nextRecord.image = 0;
+            nextRecord.text = 0;
+        } else {
+            nextRecord[normalizedScope] = 0;
+        }
+
+        const didChange = nextRecord.image !== (record.image || 0) || nextRecord.text !== (record.text || 0);
+        if (!didChange) {
+            return false;
+        }
+
+        if (nextRecord.image === 0 && nextRecord.text === 0) {
+            delete this.state.accounts[accountKey];
+        } else {
+            this.state.accounts[accountKey] = nextRecord;
+        }
+
+        this._persistStateSync();
+        this.logger.info(`[Quota] Reset ${normalizedScope} quota usage for auth #${index}.`);
+        return true;
     }
 
     getQuotaLimit(index, quotaCategory = DEFAULT_QUOTA_CATEGORY) {

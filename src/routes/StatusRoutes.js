@@ -12,6 +12,7 @@ const VersionChecker = require("../utils/VersionChecker");
 const LoggingService = require("../utils/LoggingService");
 const UsageStatsService = require("../core/UsageStatsService");
 const { isValidAccountTier, normalizeAuthDataAccountTier } = require("../utils/AccountTierUtils");
+const { normalizeCooldownScope } = require("../utils/CooldownStateUtils");
 
 /**
  * Status Routes Manager
@@ -265,6 +266,139 @@ class StatusRoutes {
             } catch (error) {
                 this.logger.error(`[WebUI] Failed to update account tier: ${error.message}`);
                 return res.status(500).json({ error: error.message, message: "accountTierUpdateFailed" });
+            }
+        });
+
+        app.post("/api/accounts/cooldown/clear", isAuthenticated, async (req, res) => {
+            try {
+                if (this._rejectIfSystemBusy(res)) return;
+                this._recordInteractiveActivity();
+
+                const rawScope = req.body?.scope;
+                const scope = normalizeCooldownScope(rawScope, {
+                    allowAll: true,
+                    fallback: "__invalid__",
+                });
+                if (scope === "__invalid__") {
+                    return res.status(400).json({ message: "errorInvalidCooldownScope" });
+                }
+
+                const rawIndices = Array.isArray(req.body?.indices) ? req.body.indices : null;
+                const requestedIndices =
+                    rawIndices && rawIndices.length > 0
+                        ? Array.from(new Set(rawIndices))
+                        : [...this.serverSystem.authSource.initialIndices];
+                if (requestedIndices.length === 0) {
+                    return res.status(200).json({
+                        clearedIndices: [],
+                        message: "accountCooldownClearNoop",
+                        quotaResetIndices: [],
+                        results: [],
+                        scope,
+                        targetIndices: [],
+                    });
+                }
+
+                const { accountQuotaService, authSource, browserManager } = this.serverSystem;
+                const validIndices = requestedIndices.filter(
+                    index => Number.isInteger(index) && authSource.initialIndices.includes(index)
+                );
+                const invalidIndices = requestedIndices.filter(
+                    index => !Number.isInteger(index) || !authSource.initialIndices.includes(index)
+                );
+                const processedIdentityKeys = new Set();
+                const clearedIndices = new Set();
+                const quotaResetIndices = new Set();
+                const results = [];
+
+                for (const index of invalidIndices) {
+                    results.push({
+                        error: "Account not found or invalid",
+                        index,
+                        success: false,
+                    });
+                }
+
+                for (const targetIndex of validIndices) {
+                    const identityKey = authSource.getAccountIdentityKey(targetIndex) || `auth:${targetIndex}`;
+                    if (processedIdentityKeys.has(identityKey)) {
+                        continue;
+                    }
+                    processedIdentityKeys.add(identityKey);
+
+                    try {
+                        const clearResult = await authSource.clearCooldown(targetIndex, scope);
+                        const quotaReset = accountQuotaService?.resetQuotaUsage(targetIndex, scope) === true;
+
+                        clearResult.clearedIndices.forEach(index => clearedIndices.add(index));
+                        if (quotaReset) {
+                            quotaResetIndices.add(targetIndex);
+                        }
+
+                        const didChange = clearResult.updated || quotaReset;
+                        results.push({
+                            cleared: clearResult.updated,
+                            index: targetIndex,
+                            noop: !didChange,
+                            quotaReset,
+                            success: true,
+                        });
+                    } catch (error) {
+                        results.push({
+                            error: error.message,
+                            index: targetIndex,
+                            success: false,
+                        });
+                        this.logger.error(
+                            `[WebUI] Failed to clear ${scope} cooldown for auth #${targetIndex}: ${error.message}`
+                        );
+                    }
+                }
+
+                if (clearedIndices.size > 0) {
+                    browserManager.rebalanceContextPool().catch(error => {
+                        this.logger.error(`[Auth] Background rebalance failed after cooldown clear: ${error.message}`);
+                    });
+                }
+
+                const payload = {
+                    clearedIndices: [...clearedIndices].sort((a, b) => a - b),
+                    message: "accountCooldownClearSuccess",
+                    quotaResetIndices: [...quotaResetIndices].sort((a, b) => a - b),
+                    results,
+                    scope,
+                    targetIndices: requestedIndices,
+                };
+                const hasFailure = results.some(result => result.success === false);
+                const hasSuccess = results.some(result => result.success === true && result.noop !== true);
+
+                this.logger.info(
+                    `[WebUI] Cleared ${scope} cooldown via WebUI. Targets=[${requestedIndices.join(
+                        ", "
+                    )}], cleared=[${payload.clearedIndices.join(", ")}], quotaReset=[${payload.quotaResetIndices.join(
+                        ", "
+                    )}].`
+                );
+
+                if (!hasSuccess && hasFailure) {
+                    payload.message = "accountCooldownClearPartial";
+                    return res.status(validIndices.length === 0 ? 404 : 207).json(payload);
+                }
+
+                if (!hasSuccess) {
+                    payload.message = "accountCooldownClearNoop";
+                    return res.status(200).json(payload);
+                }
+
+                if (hasFailure) {
+                    payload.message = "accountCooldownClearPartial";
+                    return res.status(207).json(payload);
+                }
+
+                return res.status(200).json(payload);
+            } catch (error) {
+                this.logger.error(`[WebUI] Failed to clear account cooldowns: ${error.message}`);
+                return res.status(500).json({ error: error.message, message: "accountCooldownClearFailed" });
             }
         });
 
@@ -935,6 +1069,8 @@ class StatusRoutes {
         const invalidIndices = initialIndices.filter(i => !authSource.availableIndices.includes(i));
         const rotationIndices = authSource.getRotationIndices();
         const cooldownIndices = authSource.getCooldownIndices();
+        const imageCooldownIndices = authSource.getCooldownIndices("image");
+        const textCooldownIndices = authSource.getCooldownIndices("text");
         const duplicateIndices = authSource.duplicateIndices || [];
         const expiredIndices = authSource.expiredIndices || [];
         const limit = this.logger.displayLimit || 100;
@@ -947,7 +1083,8 @@ class StatusRoutes {
 
             const canonicalIndex = isInvalid ? null : authSource.getCanonicalIndex(index);
             const cooldownInfo = authSource.getCooldownInfo(index);
-            const isCoolingDown = cooldownIndices.includes(index);
+            const cooldowns = authSource.getCooldowns(index);
+            const isCoolingDown = !isInvalid && authSource.hasAnyCooldown(index);
             const isDuplicate = canonicalIndex !== null && canonicalIndex !== index;
             const isRotation = rotationIndices.includes(index);
             const isExpired = expiredIndices.includes(index);
@@ -962,6 +1099,7 @@ class StatusRoutes {
                 cooldownRemainingMs: cooldownInfo?.cooldownUntil
                     ? Math.max(0, new Date(cooldownInfo.cooldownUntil).getTime() - Date.now())
                     : 0,
+                cooldowns,
                 cooldownUntil: cooldownInfo?.cooldownUntil || null,
                 hasContext,
                 index,
@@ -999,6 +1137,16 @@ class StatusRoutes {
                 apiKeySource: config.apiKeySource,
                 browserConnected: !!this.serverSystem.connectionRegistry.getConnectionByAuth(currentAuthIndex, false),
                 cooldownSummary: {
+                    byCategory: {
+                        image: {
+                            cooledDownIndicesRaw: imageCooldownIndices,
+                            earliestAvailableAt: authSource.getEarliestCooldownExpiry("image"),
+                        },
+                        text: {
+                            cooledDownIndicesRaw: textCooldownIndices,
+                            earliestAvailableAt: authSource.getEarliestCooldownExpiry("text"),
+                        },
+                    },
                     cooledDownIndicesRaw: cooldownIndices,
                     earliestAvailableAt: authSource.getEarliestCooldownExpiry(),
                 },
